@@ -1,0 +1,130 @@
+# Semantic Packet Admission (SAEP v2) — Implementation Plan
+
+## 1. Goal
+
+Build a system where a resource-constrained receiver (Raspberry Pi standing in for an MCU) receives a stream of data packets, each carrying a small **learned semantic tag**. When the receiver is too busy (CPU load) or the network is congested, it decides **by itself, using a learned policy over the tags**, which packets to process and which to drop. The goal is to keep task accuracy as high as possible while using as little data and compute as possible.
+
+Design principles:
+
+- **Nothing semantic is hardcoded.** The tags come from a pretrained DINOv2 backbone plus a projection trained on the CIFAR-100 training split. The admission policy is learned from data. Nobody writes rules like "face tiles are important".
+- **Decisions are cheap and early.** Scoring a packet must cost far less than processing it, ideally small enough to run in the kernel (XDP/eBPF) before the packet reaches user space.
+- **Compute must scale with accepted packets.** If the receiver's model costs the same no matter how many packets it accepts, dropping saves nothing. The receiver model is built so its cost is linear in the number of accepted packets.
+- **The two kinds of drop are measured separately.** *Uncontrolled* drops happen in the network or the socket buffer. *Controlled* drops are the receiver's admission decisions.
+
+Testbed task: CIFAR-100 classification (Kaggle competition `train` file). It is a stand-in. The architecture doesn't depend on the task.
+
+Note on "purely from training data": the DINOv2 backbone is pretrained by Meta on its own large dataset (LVD-142M). Everything trained in this project (tag projection, scorer, receiver model) uses only the CIFAR-100 training split. The whole pipeline is a black box from the system's point of view.
+
+---
+
+## 2. Problems with the current broadcaster (v1)
+
+| Issue | Why it matters | Fix in v2 |
+|---|---|---|
+| Every fragment carries the same full-image DINOv2 vector | Fragments can't be told apart, so there is no basis for choosing between them | One tag per packet, describing that packet's payload |
+| The full-image vector is nearly sufficient for classification | The experiment becomes trivial; the pixels are redundant | Tags are used **only for admission**. The receiver classifies from accepted payloads. "Tag-only" is reported as a control baseline |
+| 768 B vector per ~600 B payload | Overhead is more than 100% | Tag is 32 B int8 (configurable 16–64 B) |
+| Fragments are byte ranges of CIFAR's channel-planar layout (all R, then G, then B) | Dropping a fragment removes a band of one colour channel, which is meaningless | Packets are spatial tiles with interleaved RGB |
+| Ground-truth label in the header | The policy could cheat | Labels go to a separate sidecar log keyed by `frame_id` |
+| `255.255.255.255` | Leaves on the default interface only; awkward for controlled tests | Unicast or subnet broadcast on a dedicated link or netns |
+| DINOv2 runs inside the sender loop | Sender compute limits the send rate and muddles measurements; very slow on a Pi | Features are precomputed once on a GPU; the sender replays them |
+| Pacing is per fragment (`--interval`) | Doesn't model a frame rate or deadlines | Pacing by frames per second, with packets spread across each frame period |
+
+---
+
+## 3. System architecture
+
+```
+ ┌──────────────── Sender (laptop / netns "tx") ───────────────┐
+ │ precomputed: tiles + int8 tags + sidecar labels             │
+ │ frame scheduler (R fps) ─► packetizer ─► priority ordering ─┼──► UDP
+ │            ▲                         (uses receiver feedback)│
+ └────────────┼────────────────────────────────────────────────┘
+              │ control packets (budget, threshold, query)
+ ┌────────────┴──── Bottleneck link (tc netem / tbf) ──────────┐
+ │ rate limit, delay, queue limit, optional DSCP priority      │
+ └────────────┬────────────────────────────────────────────────┘
+              ▼
+ ┌──────────────── Receiver (Raspberry Pi / netns "rx") ───────┐
+ │ [XDP] linear int8 scorer over tag ─► XDP_DROP / XDP_PASS    │
+ │   ▲ threshold (BPF map)                                     │
+ │ [user space] parse ─► (optional MLP/contextual rescoring)   │
+ │   ─► work queue ─► receiver task model (cost ∝ #tiles)      │
+ │ load controller: CPU quota, queue depth, deadline ─► τ, k   │
+ └─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Packetization and wire format (SAEP v2)
+
+### 4.1 Tiling
+
+Each 32×32 image is split into a 4×4 grid of 8×8 tiles, giving 16 packets per frame. Each payload holds 192 bytes of HWC-interleaved uint8 RGB. Grid size is configurable: a 2×2 grid gives 4 packets of 768 B each.
+
+Tile position (`pkt_index`) is packetization metadata, not semantics. Run two variants: one where the scorer sees only the tag, and one where it sees tag plus position. This shows how much position alone contributes.
+
+### 4.2 Header
+
+```python
+# magic, version, flags, header_len, frame_id, pkt_index, pkt_count,
+# tag_dim, tag_dtype, tag_scheme_id, payload_len, payload_crc32
+SAEP_V2 = struct.Struct("!4sBBHIBBBBHHI")   # 24 bytes
+# followed by: tag (tag_dim bytes, int8, global fixed quantization scale)
+# followed by: payload (payload_len bytes)
+```
+
+- `tag_scheme_id` identifies which projection and quantization version produced the tag, so the receiver loads matching scorer weights.
+- The quantization scale is **global and fixed per scheme**, not per packet. This makes integer scores comparable across packets, which the XDP path requires.
+- Per-packet size: 24 + 32 + 192 = 248 B. Per frame: about 4.0 KB versus 3.07 KB of raw pixels (about 30% overhead, down from more than 150%).
+
+### 4.3 Control packet (receiver → sender)
+
+```python
+# magic "SAEC", version, flags, budget_per_frame, threshold (int32), query_dim
+SAEC = struct.Struct("!4sBBHiB")
+# followed by optional int8 query vector (query_dim bytes)
+```
+
+Send these at 10–20 Hz. The sender uses them to reorder and filter its traffic (see §9).
+
+---
+
+## 5. Phase 0 — Environment and data
+
+1. **Data.** Load the Kaggle `train` pickle (the existing `load_cifar_training_file` works). Make a fixed stratified split, for example 45k train and 5k validation, with the seed saved to `data/splits.json`. If the competition test set has no labels, use the validation split for all model selection. Use the standard CIFAR-100 test set for final numbers only if competition rules allow.
+2. **Machines.**
+   - GPU box (Colab, Kaggle, or a local GPU) for feature extraction and training.
+   - Raspberry Pi with 64-bit Raspberry Pi OS (kernel 6.x) as the receiver.
+   - Optional laptop as the sender.
+3. **Pi packages.**
+   `sudo apt install python3-venv clang llvm libbpf-dev bpftool iproute2 stress-ng linux-perf`
+   Then in a venv: `numpy`, `onnxruntime` (receiver inference), and optionally `torch` (CPU aarch64 wheels exist).
+4. **Pi hygiene.** Fit a heatsink or fan. Log `vcgencmd measure_temp` and `vcgencmd get_throttled` during every run, because thermal throttling silently changes CPU capacity. Pin the receiver to cores with `taskset`.
+
+**Exit criterion:** splits are saved, and the Pi can import numpy and onnxruntime.
+
+---
+
+## 6. Phase 1 — Offline feature extraction (GPU, run once)
+
+Running DINOv2 ViT-S/14 at 224 px on a Pi CPU over 50k images would take hours to a day. Run it once on a GPU and store the results.
+
+```python
+model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14").cuda().eval()
+with torch.inference_mode():
+    out = model.forward_features(x)              # x: (B,3,224,224), normalized
+    cls = out["x_norm_clstoken"]                 # (B,384)
+    pt  = out["x_norm_patchtokens"]              # (B,256,384) -> 16x16 grid
+B, D = pt.shape[0], pt.shape[-1]
+# map 16x16 patch grid onto 4x4 tile grid: each tile = 4x4 patches
+tile_tok = (pt.reshape(B, 4, 4, 4, 4, D)         # (B, tile_r, in_r, tile_c, in_c, D)
+              .mean(dim=(2, 4))                  # (B, 4, 4, D)
+              .reshape(B, 16, D))                # (B, 16, D)
+```
+
+Store `tile_tok` as fp16 (50k × 16 × 384 × 2 B ≈ 615 MB), `cls` (≈ 38 MB), and labels.
+
+**Two tag variants (both kept):**
+
+- **Contextual tags (default).** Pooled patch tokens as above. DINOv2 attention is global,

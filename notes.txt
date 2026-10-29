@@ -1,0 +1,8 @@
+Before the plan, three problems with the current broadcaster change the design, so they’re worth knowing first:
+
+The header vector describes the whole image, and it’s identical in every fragment. The receiver can’t tell fragments apart, so there’s nothing to choose between. It also gives away the answer: a linear classifier on a full-image DINOv2 vector already classifies CIFAR-100 very well, so the pixels add almost nothing. The plan uses a small vector per packet that describes that packet’s chunk, and it treats “classify from the vector alone” as a control experiment.
+The overhead is larger than the data. With dinov2_vits14, each fragment carries 768 bytes of vector. You send about 4.8 KB of headers to deliver a 3 KB image.
+The receiver can’t pick packets that the network has already dropped. Under congestion, routers drop packets before the Pi sees them. So “pick the best packets under congestion” needs a feedback loop to the sender, and the plan includes one.
+
+
+A good first step is M0–M3, done entirely offline in the simulator. That answers the core question cheaply: does a learned, tag-only policy actually beat random and FIFO drops? If it does, the netns and XDP work on the Pi is mostly engineering. I can write any piece of it, for example the v2 protocol module with tests, the feature extractor, or the XDP loader and controller.
