@@ -46,10 +46,11 @@ sender → link emulator → receiver):
 | k=4, tag + context MLP | **40.7** | 1.6–1.8 ms/frame |
 | 20% link loss + k=4, FIFO | 28.0 | 949 uncontrolled drops |
 | 20% link loss + k=4, context MLP | **40.7** | |
-| 30% rate bottleneck, raster sender | 36.3 | 3586 queue drops |
-| 30% rate bottleneck, feedback sender (SAEC, k=4) | **40.7** | 17 queue drops, sender transmits 75% fewer packets |
+| 30% rate bottleneck, raster sender | 34.7–36.3 | ~3570 queue drops; varies run to run |
+| 30% rate bottleneck, feedback sender (SAEC, k=4) | **40.7–41.0** | 5–17 queue drops, sender transmits 75% fewer packets |
 
-The test images differ between the two tables (300 vs 10k), so compare within a table.
+The test images differ between the two tables (300 vs 10k), so compare within a table. The two
+bottleneck rows depend on OS timing and move by a point or two between runs.
 
 Controls (linear probes on val): **tag-only** classification from the mean of the 16 int8 tags
 reaches 71.3%, and the **v1 full-image CLS header** reaches 83.4%. Both beat the
@@ -87,6 +88,26 @@ tags are used *only* for admission, and the receiver classifies from pixels.
                          the network already dropped.
 ```
 
+## Live simulator (browser)
+
+Open `viz/SAEP_Simulator.html` (after `python scripts/export_viz.py`). It is a single offline file; no
+server is needed. It replays the same 300 test frames as the UDP demo through a JavaScript port of
+`sender.py`, `link_emulator.py` and `receiver.py`, using the real pixels, int8 tags, per-tile CNN
+outputs and trained scorer weights. You can pick the nine `run_demo.py` presets or change policy,
+budget k, loss, bottleneck rate and SAEC feedback, step frame by frame, click a tile to see its real
+248-byte SAEP packet, and compare all five policies on the same arrivals.
+
+Validation (`node viz/parity_test.js`): packet bytes, int8 scores and context-MLP scores are
+identical to Python, offline accuracy for every k matches exactly, and the five deterministic UDP
+scenarios match the real socket run frame for frame. Scenarios with random loss or a rate limit
+match within a few points. The page shows this comparison in its validation table.
+
+Finding from building it: on Windows, `select()` in `link_emulator.py` wakes on the 15.6 ms timer
+tick or on the next arrival, so a 120 pkt/s limit actually forwards about 101 pkt/s. The surviving
+packets then lock onto one column of the 4x4 grid, which is why the raster-sender bottleneck result
+is lower than an ideal token-bucket link would give. The simulator's "Link timer" option switches
+between the two.
+
 ## Layout
 
 ```
@@ -97,6 +118,10 @@ scripts/extract_features.py  Phase 1: DINOv2 ViT-S/14 once on GPU → per-tile p
 scripts/train.py        Phase 2: tag projection, receiver, utilities, scorers, control probes
 scripts/simulate.py     Phase 3: offline policy comparison (+ CSV and plot in artifacts/)
 scripts/sender.py / receiver.py / link_emulator.py / run_demo.py   UDP end-to-end
+scripts/export_viz.py   real artifacts -> viz/data.js (+ offline viz/SAEP_Simulator.html)
+viz/engine.js           JS port of sender, link emulator and receiver (no DOM)
+viz/simulator.html      live browser simulator (source page)
+viz/parity_test.js      checks the JS engine against Python (16 checks)
 tests/test_protocol.py  wire format, corruption rejection, tiling, int scorer
 legacy/broadcaster_v1.py  original v1 broadcaster (reference only)
 ```
@@ -111,6 +136,8 @@ python scripts/extract_features.py      # ~5 min on an RTX 5060 laptop GPU
 python scripts/train.py                 # ~7 min (receiver 30 epochs); --reuse-receiver to refit scorers only
 python scripts/simulate.py
 python scripts/run_demo.py --frames 300
+python scripts/export_viz.py            # builds viz/data.js and viz/SAEP_Simulator.html
+node viz/parity_test.js                 # JS engine vs Python (needs Node.js)
 ```
 
 The Kaggle `train` pickle has the same format, so `saep.data.load_cifar` reads it too.

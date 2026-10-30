@@ -1,0 +1,1131 @@
+<title>SAEP Link Simulator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: a guided walkthrough of one pipeline. Each numbered step is a real stage a packet
+   passes through (choose scenario, watch the wire, see the decision, compare, totals, bytes,
+   validation), with a plain-language explanation beside every instrument. */
+:root {
+  --bg: #f1f3f5; --surface: #ffffff; --sunk: #eef1f4; --ink: #1a242e; --muted: #5d6a77; --faint: #8b96a2; --line: #dfe4e9;
+  --accent: #2459c9; --accent-soft: #e7eefc; --accent-ink: #ffffff;
+  --pkt: #5a7896; --ok: #17905f; --loss: #cf3a3a; --qdrop: #d9791f; --cdrop: #9aa3ae; --ctrl: #8546c9;
+  --fifo: #8a7a6c; --random: #94a0ad; --tag: #c98a1f; --ctx: #2459c9; --oracle: #17905f;
+  --hex-hdr1: #dbe6fb; --hex-hdr2: #edf1fb; --hex-tag: #f7e7c6;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", "Segoe UI", sans-serif;
+  --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --r: 10px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f151b; --surface: #161e26; --sunk: #111820; --ink: #e2e8ee; --muted: #9aa6b2; --faint: #6c7884; --line: #243039;
+  --accent: #6d9bff; --accent-soft: #1a2640; --accent-ink: #0b1220;
+  --pkt: #8fa9c4; --ok: #3cc58c; --loss: #ff6b6b; --qdrop: #f39a45; --cdrop: #6c7784; --ctrl: #b585f0;
+  --fifo: #a8988a; --random: #7d8995; --tag: #e6a83c; --ctx: #6d9bff; --oracle: #3cc58c;
+  --hex-hdr1: #1d2c48; --hex-hdr2: #18233a; --hex-tag: #3a2e14; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0f151b; --surface: #161e26; --sunk: #111820; --ink: #e2e8ee; --muted: #9aa6b2; --faint: #6c7884; --line: #243039;
+  --accent: #6d9bff; --accent-soft: #1a2640; --accent-ink: #0b1220;
+  --pkt: #8fa9c4; --ok: #3cc58c; --loss: #ff6b6b; --qdrop: #f39a45; --cdrop: #6c7784; --ctrl: #b585f0;
+  --fifo: #a8988a; --random: #7d8995; --tag: #e6a83c; --ctx: #6d9bff; --oracle: #3cc58c;
+  --hex-hdr1: #1d2c48; --hex-hdr2: #18233a; --hex-tag: #3a2e14; color-scheme: dark; }
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.6 var(--f-body); }
+.wrap { max-width: 1240px; margin: 0 auto; padding-block: 28px 56px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 28px; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(1.8rem, 1.3rem + 1.6vw, 2.5rem); font-weight: 700; line-height: 1.1; }
+h2 { font-size: 1.3rem; font-weight: 600; line-height: 1.25; }
+h3 { font-size: 1rem; font-weight: 600; }
+p { margin: 0; }
+b, strong { font-weight: 600; }
+.eyebrow { font: 600 0.72rem/1.2 var(--f-display); text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); }
+.mono { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.small { font-size: 0.84rem; }
+code { font-family: var(--f-mono); font-size: 0.85em; background: var(--sunk); padding: 1px 5px; border-radius: 4px; }
+button, select, input { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* sections */
+.step { display: grid; gap: 14px; }
+.step-head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; align-items: baseline; }
+.num { grid-row: span 2; width: 30px; height: 30px; border-radius: 50%; background: var(--ink); color: var(--surface);
+  font: 600 0.9rem/30px var(--f-mono); text-align: center; align-self: start; margin-top: 1px; }
+.explain { color: var(--muted); max-width: 78ch; }
+.explain b { color: var(--ink); }
+.card { background: var(--surface); border-radius: var(--r); padding: 20px; min-width: 0; box-shadow: 0 1px 0 var(--line); }
+.card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+
+/* header */
+.top { display: grid; gap: 14px; }
+.top .lede { max-width: 72ch; font-size: 1.02rem; }
+.howto { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.howto div { background: var(--surface); border-radius: var(--r); padding: 14px 16px; font-size: 0.88rem; color: var(--muted); box-shadow: 0 1px 0 var(--line); }
+.howto b { display: block; color: var(--ink); font-family: var(--f-display); font-size: 0.98rem; margin-bottom: 2px; }
+.prov { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font: 0.8rem/1.4 var(--f-mono); color: var(--muted); }
+.prov b { color: var(--ink); font-weight: 500; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--line); font: 500 0.74rem/1.6 var(--f-mono); }
+.pill.good { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.pill.bad { color: var(--loss); border-color: color-mix(in srgb, var(--loss) 40%, transparent); }
+
+/* scenario */
+.presets { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { border: 1px solid var(--line); background: var(--surface); border-radius: 99px; padding: 5px 12px; cursor: pointer; font-size: 0.84rem; }
+.chip:hover { border-color: var(--accent); }
+.chip[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.scen-desc { margin-top: 14px; padding: 14px 16px; border-radius: 8px; background: var(--accent-soft); display: grid; gap: 4px; }
+.scen-desc .t { font: 600 0.98rem/1.3 var(--f-display); }
+.scen-desc .d { font-size: 0.92rem; }
+details.more { margin-top: 14px; }
+details.more > summary { cursor: pointer; font-weight: 500; font-size: 0.9rem; color: var(--accent); list-style: none; display: inline-flex; align-items: center; gap: 6px; }
+details.more > summary::-webkit-details-marker { display: none; }
+details.more > summary::before { content: "▸"; transition: transform .15s; display: inline-block; }
+details.more[open] > summary::before { transform: rotate(90deg); }
+.knobs { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px 24px; margin-top: 14px; }
+.knob { display: grid; gap: 5px; min-width: 0; align-content: start; }
+.knob .lbl { font-weight: 600; font-size: 0.86rem; display: flex; justify-content: space-between; gap: 8px; }
+.knob output { font: 500 0.82rem/1.5 var(--f-mono); color: var(--accent); }
+.knob .help { font-size: 0.8rem; color: var(--muted); line-height: 1.45; }
+input[type="range"] { width: 100%; accent-color: var(--accent); }
+.seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { flex: 1; border: 0; background: var(--surface); padding: 6px 4px; cursor: pointer; font-size: 0.8rem; white-space: nowrap; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+select { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; width: 100%; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 0.86rem; cursor: pointer; }
+.check input { accent-color: var(--accent); width: 16px; height: 16px; flex: none; }
+
+/* stage */
+.transport { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.btn { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 0.86rem; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; min-width: 86px; }
+.transport select { width: auto; }
+.clock { font: 0.82rem/1.2 var(--f-mono); color: var(--muted); margin-left: auto; }
+.clock b { color: var(--ink); font-weight: 500; }
+.topo-scroll { overflow-x: auto; margin-top: 4px; }
+#topo { display: block; width: 100%; min-width: 760px; height: 300px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.8rem; color: var(--muted); padding-top: 10px; border-top: 1px solid var(--line); margin-top: 6px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 14px; height: 9px; border-radius: 2px; display: inline-block; }
+.narr { margin-top: 14px; padding: 14px 16px; border-radius: 8px; background: var(--sunk); font-size: 0.94rem; line-height: 1.65; }
+.narr .lbl { font: 600 0.7rem/1.2 var(--f-display); text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); display: block; margin-bottom: 4px; }
+.narr .ok { color: var(--ok); font-weight: 600; } .narr .bad { color: var(--loss); font-weight: 600; }
+.narr .l { color: var(--loss); } .narr .q { color: var(--qdrop); } .narr .c { color: var(--muted); }
+.banner { margin-top: 10px; padding: 12px 16px; border-radius: 8px; background: var(--accent-soft); font-size: 0.9rem; }
+.stages { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+@media (max-width: 820px) { .stages { grid-template-columns: minmax(0, 1fr); } }
+.stages > div { font-size: 0.86rem; color: var(--muted); line-height: 1.55; }
+.stages h3 { color: var(--ink); display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.mini { width: 20px; height: 20px; border-radius: 50%; background: var(--ink); color: var(--surface); font: 600 0.72rem/20px var(--f-mono); text-align: center; flex: none; }
+
+/* decision pair */
+.pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 780px) { .pair { grid-template-columns: minmax(0, 1fr); } }
+.imgrow { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.tilecv { width: 200px; height: 200px; max-width: 100%; border-radius: 6px; cursor: crosshair; display: block; }
+.facts { display: grid; gap: 8px; font-size: 0.86rem; min-width: 0; flex: 1 1 150px; margin: 0; }
+.facts dt { font-size: 0.76rem; color: var(--muted); }
+.facts dd { margin: 0; font-family: var(--f-mono); font-size: 0.84rem; overflow-wrap: anywhere; }
+#tagmap { width: 100%; height: 90px; margin-top: 14px; display: block; image-rendering: pixelated; border-radius: 4px; }
+.cap { font-size: 0.82rem; color: var(--muted); margin-top: 10px; line-height: 1.5; }
+.key-row { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 0.78rem; color: var(--muted); margin-top: 8px; }
+.key-row span { display: inline-flex; align-items: center; gap: 5px; }
+.kbox { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+.verdict { font-weight: 600; font-size: 0.9rem; }
+.bars { display: grid; gap: 5px; margin-top: 14px; }
+.bar { display: grid; grid-template-columns: minmax(0, 1fr) 46px; gap: 8px; align-items: center; font-size: 0.82rem; }
+.bar .track { position: relative; height: 20px; background: var(--sunk); border-radius: 4px; overflow: hidden; }
+.bar .fill { position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--accent) 26%, transparent); }
+.bar.truth .fill { background: color-mix(in srgb, var(--ok) 34%, transparent); }
+.bar .name { position: relative; padding-left: 8px; line-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar .v { font-family: var(--f-mono); font-size: 0.78rem; text-align: right; }
+
+/* compare */
+.cmp { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 900px) { .cmp { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .cmp { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.pol { display: grid; gap: 6px; padding: 12px; border-radius: 8px; background: var(--sunk); align-content: start; min-width: 0; }
+.pol.cur { box-shadow: inset 0 0 0 2px var(--accent); }
+.pol .nm { display: flex; align-items: center; gap: 6px; font: 600 0.9rem/1.2 var(--f-display); }
+.pol .how { font-size: 0.76rem; color: var(--muted); line-height: 1.4; min-height: 2.8em; }
+.pol canvas { width: 100%; aspect-ratio: 1; max-width: 130px; border-radius: 4px; display: block; }
+.pol .pred { font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pol .run { font: 0.78rem/1.3 var(--f-mono); color: var(--muted); }
+.pol .run b { color: var(--ink); font-size: 1rem; font-weight: 600; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
+
+/* meters */
+.meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+.meter { background: var(--surface); border-radius: var(--r); padding: 14px 16px; display: grid; gap: 2px; align-content: start; min-width: 0; box-shadow: 0 1px 0 var(--line); }
+.meter .k { font-size: 0.8rem; color: var(--muted); }
+.meter .v { font: 600 1.45rem/1.25 var(--f-mono); font-variant-numeric: tabular-nums; }
+.meter .s { font-size: 0.76rem; color: var(--muted); line-height: 1.4; }
+.meter.wide { grid-column: span 2; }
+@media (max-width: 520px) { .meter.wide { grid-column: auto; } }
+#spark { width: 100%; height: 40px; display: block; margin-top: 6px; }
+
+/* inspector */
+.insp-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 20px; }
+@media (max-width: 900px) { .insp-grid { grid-template-columns: minmax(0, 1fr); } }
+.tabs { display: flex; gap: 4px; }
+.tabs button { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 4px 10px; font-size: 0.8rem; cursor: pointer; }
+.tabs button[aria-selected="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.hex { font: 0.76rem/1.6 var(--f-mono); overflow-x: auto; background: var(--sunk); border-radius: 6px; padding: 10px 12px; max-height: 250px; overflow-y: auto; }
+.hex .row { display: flex; gap: 12px; white-space: pre; }
+.hex .off { color: var(--faint); }
+.hex .b { padding: 0 1px; border-radius: 2px; }
+.hex .asc { color: var(--faint); }
+.hex .b.on { outline: 1.5px solid var(--accent); }
+.zones { display: flex; height: 26px; border-radius: 4px; overflow: hidden; margin-top: 10px; font: 500 0.72rem/26px var(--f-mono); }
+.zones div { text-align: center; white-space: nowrap; overflow: hidden; color: var(--ink); }
+.fields { width: 100%; border-collapse: collapse; font-size: 0.8rem; table-layout: fixed; }
+.fields td { padding: 4px 6px; border-top: 1px solid var(--line); vertical-align: top; }
+.fields td:first-child { font-family: var(--f-mono); color: var(--muted); white-space: nowrap; width: 58px; }
+.fields td:nth-child(2) { width: 36%; }
+.fields td:nth-child(3) { font-family: var(--f-mono); overflow-wrap: anywhere; }
+.fields tr:hover td { background: var(--sunk); }
+.key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; border: 1px solid var(--line); }
+
+/* validation */
+.val { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 24px; }
+@media (max-width: 1000px) { .val { grid-template-columns: minmax(0, 1fr); } }
+.tbl-wrap { overflow-x: auto; }
+table.vt { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+.vt th { text-align: left; font-weight: 500; font-size: 0.76rem; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.vt td { padding: 7px 8px; border-bottom: 1px solid var(--line); }
+.vt td.n { font-family: var(--f-mono); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.vt th.n { text-align: right; }
+.vt tr.cur td { background: var(--accent-soft); }
+.vt .load { border: 1px solid var(--line); background: var(--surface); border-radius: 6px; padding: 2px 8px; font-size: 0.76rem; cursor: pointer; }
+.vt .load:hover { border-color: var(--accent); }
+#chart { width: 100%; height: auto; display: block; }
+.notes { display: grid; gap: 10px; font-size: 0.86rem; color: var(--muted); max-width: 90ch; margin-top: 16px; }
+.notes b { color: var(--ink); }
+
+/* glossary */
+.gloss { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px 28px; margin: 14px 0 0; }
+.gloss div { font-size: 0.86rem; color: var(--muted); line-height: 1.5; }
+.gloss dt { color: var(--ink); font-weight: 600; font-size: 0.9rem; }
+.gloss dd { margin: 0; }
+footer { font-size: 0.84rem; color: var(--muted); display: grid; gap: 8px; }
+pre.cmd { font: 0.8rem/1.6 var(--f-mono); background: var(--surface); padding: 12px 14px; border-radius: 8px; overflow-x: auto; margin: 0; color: var(--ink); }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="eyebrow">BACSE203 Computer Networks · project demo</div>
+    <h1>SAEP Link Simulator</h1>
+    <p class="lede">A weak receiver, such as a Raspberry Pi, gets a stream of images over UDP. It can't afford to
+      process every packet, and the network loses some on the way. <b>SAEP</b> (Semantic-Aware Encoding Protocol) adds a 32-byte summary, a <i>tag</i>,
+      to every packet. The receiver reads the tags and spends its limited CPU on the packets that
+      matter most. This page plays that pipeline live, using the project's real images, tags and trained models.</p>
+    <div class="howto">
+      <div><b>One image = one frame</b>Each 32×32 test image is cut into a 4×4 grid. Each of the 16 tiles is sent as its own UDP packet.</div>
+      <div><b>One packet = 248 bytes</b>24 B header, then the 32 B tag, then the 192 B of pixels. The tag lets the receiver judge a packet without decoding the pixels.</div>
+      <div><b>The receiver's budget is k</b>It can process only <i>k</i> tiles per frame, for example 4 of 16. Its policy decides which ones.</div>
+      <div><b>Success = correct label</b>A small CNN classifies the image from the admitted tiles only. Better choices mean more correct answers for the same CPU.</div>
+    </div>
+    <div class="prov">
+      <span><b>300</b> CIFAR-100 test images</span><span>weights from <b>artifacts/</b></span>
+      <span id="parityPill" class="pill">checking against the real UDP run…</span>
+    </div>
+  </header>
+
+  <!-- 1. scenario -->
+  <section class="step" aria-labelledby="h-scen">
+    <div class="step-head"><span class="num">1</span><h2 id="h-scen">Choose a scenario</h2>
+      <p class="explain">These are the nine experiments the project ran over real UDP sockets (<code>scripts/run_demo.py</code>). Pick one and the animation below restarts with it.</p></div>
+    <div class="card">
+      <div class="presets" id="presets" role="group" aria-label="Scenarios"></div>
+      <div class="scen-desc" id="scenDesc" aria-live="polite"><span class="t" id="scenT"></span><span class="d" id="scenD"></span></div>
+      <details class="more" id="moreKnobs">
+        <summary>Adjust the settings yourself</summary>
+        <div class="knobs">
+          <div class="knob">
+            <span class="lbl">How the receiver chooses</span>
+            <div class="seg" id="policySeg" role="group" aria-label="Receiver admission policy"></div>
+            <span class="help" id="polHelp"></span>
+          </div>
+          <div class="knob">
+            <label class="lbl" for="kIn">Budget k <output id="kOut">4 tiles/frame</output></label>
+            <input type="range" id="kIn" min="1" max="16" step="1" value="4">
+            <span class="help">How many of the 16 tiles the receiver has CPU time to process per frame.</span>
+          </div>
+          <div class="knob">
+            <label class="lbl" for="lossIn">Random loss on the link <output id="lossOut">20%</output></label>
+            <input type="range" id="lossIn" min="0" max="60" step="5" value="20">
+            <span class="help">Chance that any packet disappears in the network, like a noisy Wi-Fi link.</span>
+          </div>
+          <div class="knob">
+            <label class="lbl" for="rateIn">Link capacity limit <output id="rateOut">off</output></label>
+            <input type="range" id="rateIn" min="0" max="100" step="5" value="0">
+            <span class="help">The sender offers 400 packets/s. Below that, the link queue fills and overflows (congestion).</span>
+          </div>
+          <div class="knob">
+            <span class="lbl">Feedback to the sender</span>
+            <label class="check" for="fbIn"><input type="checkbox" id="fbIn"> Sender obeys SAEC and sends only its top k</label>
+            <span class="help">The receiver tells the sender its budget every 100 ms. The sender can then skip tiles that would be wasted.</span>
+          </div>
+          <div class="knob">
+            <label class="lbl" for="timerIn">Link timing model</label>
+            <select id="timerIn">
+              <option value="win">Windows select() loop (as measured)</option>
+              <option value="ideal">Ideal token bucket</option>
+            </select>
+            <span class="help">Only affects the capacity limit. Step 7 explains why the real Windows emulator is slower than its setting.</span>
+          </div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 2. the wire -->
+  <section class="step" aria-labelledby="h-wire">
+    <div class="step-head"><span class="num">2</span><h2 id="h-wire">Watch the packets travel</h2>
+      <p class="explain">Three programs talk over UDP on one machine (127.0.0.1). The animation is slowed down about 25× so you can follow single packets. Each box carries the tile number.</p></div>
+    <div class="card">
+      <div class="transport">
+        <button class="btn primary" id="playBtn" type="button">Pause</button>
+        <button class="btn" id="stepBtn" type="button" title="Play until the next frame is decided, then pause">Next frame ›</button>
+        <button class="btn" id="restartBtn" type="button">Restart</button>
+        <select id="speedIn" aria-label="Playback speed">
+          <option value="0.02">Very slow</option>
+          <option value="0.04" selected>Slow</option>
+          <option value="0.1">Medium</option>
+          <option value="0.25">Fast</option>
+          <option value="1">Real time (25 fps)</option>
+        </select>
+        <span class="clock">frame <b id="clkF">0</b> of 300 · simulated time <b id="clkT">0.000</b> s</span>
+      </div>
+      <div class="topo-scroll"><canvas id="topo" aria-label="Animated network: sender, link, receiver"></canvas></div>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--pkt)"></i>packet in transit</span>
+        <span><i class="sw" style="background:var(--loss)"></i>lost in the network</span>
+        <span><i class="sw" style="background:var(--qdrop)"></i>dropped: link queue full</span>
+        <span><i class="sw" style="background:var(--cdrop)"></i>skipped by the receiver</span>
+        <span><i class="sw" style="background:var(--ok)"></i>processed by the CNN</span>
+        <span><i class="sw" style="background:var(--ctrl)"></i>SAEC feedback</span>
+      </div>
+      <div class="narr" aria-live="polite"><span class="lbl">What just happened</span><span id="narr">Starting…</span></div>
+      <div class="banner" id="banner" hidden></div>
+      <div class="stages">
+        <div><h3><span class="mini">A</span>Sender</h3>Sends the frame's tiles as 16 packets spread evenly over 40 ms (25 frames per second). Each packet carries its tile's tag. With feedback on, it first ranks its own tiles and sends only the best <i>k</i>.</div>
+        <div><h3><span class="mini">B</span>Link</h3>Simulates a real network path. A packet can vanish at random (<span style="color:var(--loss)">red ✕</span>). If the link is slower than the traffic, packets wait in an 8-slot queue. When the queue is full, newcomers are thrown away (<span style="color:var(--qdrop)">orange</span>). This is called drop-tail.</div>
+        <div><h3><span class="mini">C</span>Receiver</h3>Reads each packet's tag first, without touching the pixels. Its policy decides which <i>k</i> packets to keep. The rest are skipped (<span style="color:var(--cdrop)">grey</span>). The kept tiles go to the CNN (<span style="color:var(--ok)">green</span>), and its compute time grows with every tile. It also sends SAEC feedback back to the sender (<span style="color:var(--ctrl)">purple</span>).</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. decision -->
+  <section class="step" aria-labelledby="h-dec">
+    <div class="step-head"><span class="num">3</span><h2 id="h-dec">What was sent, and what the receiver kept</h2>
+      <p class="explain">Left: the frame leaving the sender. Right: the last frame the receiver finished, showing only the tiles it chose to process. Click any tile to see its packet's bytes in step 6.</p></div>
+    <div class="pair">
+      <div class="card">
+        <div class="card-head"><h3>Sender · frame <span class="mono" id="sF">0</span></h3><span class="muted small" id="sMode">raster order</span></div>
+        <div class="imgrow">
+          <canvas class="tilecv" id="sendCv" width="200" height="200" aria-label="Frame being sent"></canvas>
+          <dl class="facts">
+            <div><dt>True label (never sent on the wire)</dt><dd id="sLabel">–</dd></div>
+            <div><dt>Order the tiles are sent</dt><dd id="sOrder">–</dd></div>
+            <div><dt>Pacing</dt><dd id="sPace">–</dd></div>
+          </dl>
+        </div>
+        <canvas id="tagmap" width="32" height="16" aria-label="The 16 tags of this frame"></canvas>
+        <p class="cap"><b style="color:var(--ink)">The tags of this frame.</b> One row per packet, 32 numbers per row (int8, −127…127; blue negative, amber positive). They are a compressed description of each tile from a vision model (DINOv2). This strip is everything the receiver uses to choose.</p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Receiver · frame <span class="mono" id="rF">–</span></h3><span class="verdict" id="rVerdict"></span></div>
+        <div class="imgrow">
+          <canvas class="tilecv" id="recvCv" width="200" height="200" aria-label="Tiles the receiver processed"></canvas>
+          <dl class="facts">
+            <div><dt>Arrived, then kept</dt><dd id="rCounts">–</dd></div>
+            <div><dt>CNN compute for this frame</dt><dd id="rCpu">–</dd></div>
+            <div><dt id="rScoreLbl">Score</dt><dd id="rScore">–</dd></div>
+          </dl>
+        </div>
+        <div class="key-row">
+          <span><i class="kbox" style="outline:2px solid var(--ok);outline-offset:-2px;background:var(--sunk)"></i>kept, sent to the CNN</span>
+          <span><i class="kbox" style="background:repeating-linear-gradient(135deg,var(--cdrop) 0 1px,transparent 1px 4px)"></i>arrived, skipped</span>
+          <span><span style="color:var(--loss)">✕</span> lost on the link</span>
+          <span>— not sent</span>
+        </div>
+        <div class="bars" id="rBars"></div>
+        <p class="cap">The CNN's top three guesses and their confidence, computed from the kept tiles only. The number on each tile is its score under the active policy (higher = more likely to be kept).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. compare -->
+  <section class="step" aria-labelledby="h-cmp">
+    <div class="step-head"><span class="num">4</span><h2 id="h-cmp">Would another policy have done better?</h2>
+      <p class="explain">The same frame, with the same surviving packets and the same budget <i>k</i>, decided by all five policies. The percentage under each is its accuracy over every frame so far. The highlighted one is the policy currently running.</p></div>
+    <div class="card">
+      <div class="cmp" id="cmp"></div>
+      <p class="cap" id="cmpN"></p>
+    </div>
+  </section>
+
+  <!-- 5. totals -->
+  <section class="step" aria-labelledby="h-tot">
+    <div class="step-head"><span class="num">5</span><h2 id="h-tot">Running totals</h2>
+      <p class="explain">Counted since the scenario last changed. Accuracy is the share of frames the CNN labelled correctly. The dashed line in its chart is the best case: every tile, no loss.</p></div>
+    <div class="meters">
+      <div class="meter"><span class="k">Frames decided</span><span class="v" id="mFrames">0</span><span class="s">images classified</span></div>
+      <div class="meter"><span class="k">Packets sent</span><span class="v" id="mSent">0</span><span class="s" id="mSentS">0 kB</span></div>
+      <div class="meter"><span class="k">Lost in the network</span><span class="v" id="mLoss" style="color:var(--loss)">0</span><span class="s">random loss</span></div>
+      <div class="meter"><span class="k">Dropped by full queue</span><span class="v" id="mQ" style="color:var(--qdrop)">0</span><span class="s">congestion</span></div>
+      <div class="meter"><span class="k">Skipped by receiver</span><span class="v" id="mC">0</span><span class="s">its own choice, to save CPU</span></div>
+      <div class="meter"><span class="k">Tiles processed / frame</span><span class="v" id="mAdm">0</span><span class="s" id="mCpu">0 ms CPU</span></div>
+      <div class="meter wide"><span class="k">Accuracy</span><span class="v" id="mAcc">–</span><span class="s" id="mAccS"></span><canvas id="spark" aria-label="Accuracy over time"></canvas></div>
+    </div>
+  </section>
+
+  <!-- 6. bytes -->
+  <section class="step" aria-labelledby="h-pkt">
+    <div class="step-head"><span class="num">6</span><h2 id="h-pkt">Inside one packet</h2>
+      <p class="explain">The exact bytes this tile would have on the wire, built the same way as <code>saep/protocol.py</code>. Hover a field to highlight its bytes. A fast in-kernel filter (XDP) would only need the first 56 bytes, the header plus the tag, to decide.</p></div>
+    <div class="card">
+      <div class="card-head">
+        <h3>Packet <span class="mono muted small" id="iTitle"></span></h3>
+        <div class="tabs" role="tablist">
+          <button role="tab" id="tabData" aria-selected="true" type="button">Data packet (SAEP)</button>
+          <button role="tab" id="tabCtrl" aria-selected="false" type="button">Feedback packet (SAEC)</button>
+        </div>
+      </div>
+      <div class="insp-grid">
+        <div>
+          <div class="zones" id="zones"></div>
+          <div class="hex" id="hex" aria-label="Hex dump" style="margin-top:10px"></div>
+          <label class="check small" for="followIn" style="margin-top:10px"><input type="checkbox" id="followIn"> Follow the newest kept packet automatically</label>
+        </div>
+        <div><table class="fields" id="fields"></table></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7. validation -->
+  <section class="step" aria-labelledby="h-val">
+    <div class="step-head"><span class="num">7</span><h2 id="h-val">Can this simulation be trusted?</h2>
+      <p class="explain">Each of the nine scenarios is run here in the browser over all 300 frames and compared with what the real Python programs measured over real UDP sockets (<code>artifacts/demo_results.json</code>). The chart shows the larger offline experiment on all 10,000 test images.</p></div>
+    <div class="card">
+      <div class="val">
+        <div class="tbl-wrap">
+          <table class="vt" id="vt">
+            <thead><tr><th>Scenario</th><th class="n">Real UDP run</th><th class="n">This page</th><th class="n">Packets through link<br>(real / here)</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div><svg id="chart" viewBox="0 0 560 330" role="img" aria-label="Accuracy versus budget k"></svg>
+          <p class="cap">Each line is one policy. Read it at your budget <i>k</i> (dashed). The context MLP stays highest at small <i>k</i>, which is where it matters. At k = 16 every policy keeps everything, so they meet at 50%.</p></div>
+      </div>
+      <div class="notes">
+        <p><b>“exact”</b> means the result matches the real run frame for frame. Without random loss or a capacity limit nothing is random, so the browser and Python must agree exactly, and they do.</p>
+        <p><b>“Δ”</b> rows involve chance (random loss, random picks, operating-system timing). Even two real UDP runs differ by a point or two, so agreement within a few points is the expected result.</p>
+        <p><b>Why the capacity-limited link behaves oddly.</b> On Windows, <code>link_emulator.py</code> waits in <code>select()</code>, which wakes either on the next packet or on the 15.6 ms system timer. So a link set to 120 packets/s really forwards about 101/s. The packets that survive then fall into a fixed rhythm, often one column of the image. Set the link timing model to “ideal” in step 1 to compare.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- glossary -->
+  <section class="step" aria-labelledby="h-gl">
+    <div class="step-head"><span class="num">?</span><h2 id="h-gl">Terms used on this page</h2><p class="explain">Short definitions, in the order they appear.</p></div>
+    <details class="card more" style="margin-top:0">
+      <summary>Show the glossary</summary>
+      <dl class="gloss">
+        <div><dt>UDP</dt><dd>A transport protocol that sends packets without retransmission. A lost packet stays lost. That suits live video, where a late packet is useless.</dd></div>
+        <div><dt>Frame / tile</dt><dd>A frame is one image. It is split into 16 tiles of 8×8 pixels, one per packet.</dd></div>
+        <div><dt>Tag</dt><dd>32 bytes per packet describing its tile, made by compressing the output of a pretrained vision model (DINOv2) down to 32 signed 8-bit numbers.</dd></div>
+        <div><dt>Budget k</dt><dd>How many tiles per frame the receiver has CPU time to process. CNN cost grows with every tile: about 1.1 ms for 4 tiles, 3 ms for 16 on this laptop.</dd></div>
+        <div><dt>Admission policy</dt><dd>The rule that decides which arrived packets get processed.</dd></div>
+        <div><dt>FIFO</dt><dd>First in, first out: keep the first k packets that arrive. Since tiles are sent row by row, that is usually the top of the image.</dd></div>
+        <div><dt>int8 tag scorer / XDP</dt><dd>Score = a weighted sum of the tag bytes, using integers only. That simple enough to run inside the Linux kernel's XDP hook. It judges each packet alone, with a threshold τ.</dd></div>
+        <div><dt>Threshold τ</dt><dd>The score a packet must reach to be kept. It is adjusted automatically so that, on average, about k packets per frame pass.</dd></div>
+        <div><dt>Context MLP</dt><dd>A small neural network (8.4 k weights) that scores each tag relative to the other tags in the same frame. It needs the whole frame first, so it runs in user space.</dd></div>
+        <div><dt>Oracle</dt><dd>Cheats by using the true label to pick the most useful tiles. Not a real policy: it shows the best possible choice.</dd></div>
+        <div><dt>Drop-tail queue</dt><dd>A buffer in front of a slow link. When it is full, newly arriving packets are discarded. The packets at the tail end lose.</dd></div>
+        <div><dt>SAEC</dt><dd>The 13-byte control packet the receiver sends back 10 times a second, carrying its budget k and threshold τ.</dd></div>
+        <div><dt>CRC32</dt><dd>A checksum of the pixel payload in the header. The receiver rejects a packet whose pixels were corrupted.</dd></div>
+        <div><dt>CIFAR-100</dt><dd>A standard dataset of 32×32 colour images in 100 classes. The CNN reaches 54.7% using all 16 tiles of these 300 images.</dd></div>
+      </dl>
+    </details>
+  </section>
+
+  <footer>
+    <span>To regenerate this page's data and re-run every check, from the project folder:</span>
+    <pre class="cmd">python -m unittest discover -s tests      # packet format, CRC, tiling
+python scripts/simulate.py                # offline results on 10,000 images
+python scripts/run_demo.py --frames 300   # real UDP: sender → link_emulator → receiver
+python scripts/export_viz.py              # real artifacts → viz/data.js, rebuilds this page
+node viz/parity_test.js                   # browser engine vs Python, 16 checks</pre>
+  </footer>
+</div>
+
+<script src="data.js"></script>
+<script src="engine.js"></script>
+<script>
+(() => {
+  "use strict";
+  const E = window.SAEPEngine, D = window.SAEP_DATA, ds = new E.Dataset(D);
+  const P = ds.P, G = ds.grid, HOP = 0.010, PERIOD = 1 / 25, OFFERED = P * 25;
+  const POL = [["fifo", "FIFO"], ["random", "Random"], ["tag", "int8 tag"], ["ctx", "Context MLP"]];
+  const POL_ALL = [...POL, ["oracle", "Oracle"]];
+  const POL_HOW = {
+    fifo: "Keeps the first k packets that arrive.",
+    random: "Keeps k packets at random.",
+    tag: "Scores each tag alone with integer math (XDP-ready).",
+    ctx: "Waits for the frame, compares all tags, keeps the best k.",
+    oracle: "Uses the true label. Upper bound only.",
+  };
+  const POL_HELP = {
+    fifo: "FIFO: no scoring. The first k packets to arrive are processed, the rest skipped.",
+    random: "Random: each packet gets a random score. Shows what choosing blindly achieves.",
+    tag: "int8 tag: each packet is scored on arrival from its tag alone, and kept if the score passes τ. Cheap enough for the kernel.",
+    ctx: "Context MLP: the receiver buffers the whole frame, scores every tag relative to the others, and keeps the top k. This is the project's method.",
+  };
+  const SCEN = [
+    ["Baseline: nothing is lost, everything is processed", "The receiver processes all 16 tiles of every frame. This is the best accuracy the CNN can reach (54.7%), and also the most CPU it can use."],
+    ["Budget 4, keep whatever arrives first", "The receiver only has CPU for 4 of the 16 tiles. FIFO keeps the first 4 to arrive, which is always the top row of the image. Accuracy collapses."],
+    ["Budget 4, keep 4 at random", "Same budget, but the 4 tiles are picked at random. Just spreading the picks across the image already helps a lot."],
+    ["Budget 4, cheap per-packet scoring (XDP-style)", "Each tag is scored with a simple integer formula as the packet arrives. It cannot see the rest of the frame, so here it does no better than random. This finding is why the project added the context MLP."],
+    ["Budget 4, the project's method", "The receiver waits for the whole frame, scores all 16 tags together with a small neural network, and keeps the 4 best. It reaches 40.7%, against 25.7% for FIFO, with the same CPU."],
+    ["1 in 5 packets lost, FIFO", "The network now loses 20% of packets at random. FIFO still keeps whatever arrives first."],
+    ["1 in 5 packets lost, the project's method", "Same losses, but the context MLP picks the best 4 of the survivors. Accuracy barely changes from the loss-free case."],
+    ["Congested link, sender sends everything", "The link can carry only 30% of the traffic. The sender still sends all 16 tiles, so the queue overflows and the network, not the receiver, decides which tiles survive."],
+    ["Congested link, sender listens to feedback", "Same narrow link, but the receiver tells the sender its budget (SAEC). The sender sends only its 4 best tiles, so almost nothing is dropped and 75% less traffic is sent."],
+  ];
+  const $ = id => document.getElementById(id);
+  const fmtPct = x => (x * 100).toFixed(1) + "%";
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+  /* ---------- colours come from the CSS tokens so the canvas follows the theme ---------- */
+  let C = {};
+  function readTokens() {
+    const cs = getComputedStyle(document.documentElement);
+    for (const k of ["bg", "surface", "sunk", "ink", "muted", "faint", "line", "accent", "pkt", "ok", "loss", "qdrop", "cdrop",
+      "ctrl", "fifo", "random", "tag", "ctx", "oracle", "hex-hdr1", "hex-hdr2", "hex-tag"]) C[k] = cs.getPropertyValue("--" + k).trim();
+    drawChart(); renderReceiver(); renderCompare(); renderMeters(); renderInspector();
+  }
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", readTokens);
+  new MutationObserver(readTokens).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  /* ---------- frame pixels ---------- */
+  const imgCache = [];
+  function frameImg(f) {
+    if (imgCache[f]) return imgCache[f];
+    const c = document.createElement("canvas"); c.width = c.height = 32;
+    const x = c.getContext("2d"), id = x.createImageData(32, 32), b = f * 3072;
+    for (let i = 0; i < 1024; i++) {
+      id.data[i * 4] = ds.images[b + i * 3]; id.data[i * 4 + 1] = ds.images[b + i * 3 + 1];
+      id.data[i * 4 + 2] = ds.images[b + i * 3 + 2]; id.data[i * 4 + 3] = 255;
+    }
+    x.putImageData(id, 0, 0);
+    return (imgCache[f] = c);
+  }
+  function hidpi(cv, w, h) {
+    const r = Math.min(window.devicePixelRatio || 1, 2);
+    if (cv.width !== Math.round(w * r) || cv.height !== Math.round(h * r)) { cv.width = Math.round(w * r); cv.height = Math.round(h * r); }
+    const x = cv.getContext("2d"); x.setTransform(r, 0, 0, r, 0, 0); x.imageSmoothingEnabled = false;
+    return x;
+  }
+  const className = c => ds.names[c].replace(/_/g, " ");
+
+  /* ---------- state ---------- */
+  const S = {
+    cfg: null, preset: 6, speed: 0.04, playing: !reduced, simT: 0, sim: null, frames: [], ci: 0,
+    lastClosed: null, lastCmp: null, cnt: null, cmp: null, hist: [], stepTarget: null, ended: false,
+    sel: null, follow: false, tab: "data", wall: performance.now(), cmpRng: E.mulberry32(99),
+  };
+  function presetCfg(i) { const s = E.SCENARIOS[i]; return { k: s.k, policy: s.policy, loss: s.loss, rate: s.rate, feedback: s.feedback, ideal: false }; }
+  function engineCfg() {
+    const c = S.cfg;
+    return { k: c.k, policy: c.policy, loss: c.loss, rate: c.rate, feedback: c.feedback, prop: HOP,
+      linkTick: c.ideal ? 0 : E.WINDOWS_TIMER_TICK };
+  }
+  function resetCounters() {
+    S.cnt = { frames: 0, sent: 0, loss: 0, qdrop: 0, recv: 0, cdrop: 0, adm: 0, ok: 0, cpu: 0 };
+    S.cmp = Object.fromEntries(POL_ALL.map(([k]) => [k, { ok: 0, n: 0 }]));
+    S.hist = [];
+  }
+  function rebuild(startFrame) {
+    S.sim = new E.Simulation(ds, engineCfg());
+    const f0 = Math.min(startFrame || 0, ds.n - 1);
+    for (let i = 0; i < f0; i++) S.sim.next();
+    S.frames = []; S.ci = 0; S.ended = false; S.stepTarget = null;
+    S.simT = S.sim.wire[f0].tFrame;
+    resetCounters();
+    $("banner").hidden = true;
+    syncControls(); markValidationRow();
+  }
+
+  /* ---------- simulation clock ---------- */
+  function ensure() {
+    while (!S.sim.done() && (!S.frames.length || S.frames.at(-1).tFrame < S.simT + 0.12)) S.frames.push(S.sim.next());
+  }
+  function closeFrames() {
+    while (S.ci < S.frames.length && S.frames[S.ci].tClose <= S.simT) onClose(S.frames[S.ci++]);
+    let drop = 0;
+    while (drop < S.ci - 1 && S.frames[drop].tClose + 0.1 < S.simT) drop++;
+    if (drop) { S.frames.splice(0, drop); S.ci -= drop; }
+  }
+  function onClose(rec) {
+    const c = S.cnt;
+    c.frames++; c.sent += rec.pkts.length; c.recv += rec.arrived.length; c.adm += rec.admitted.length;
+    c.cdrop += rec.arrived.length - rec.admitted.length; c.cpu += rec.cpuMs; c.ok += rec.correct ? 1 : 0;
+    for (const p of rec.pkts) { if (p.fate === "loss") c.loss++; else if (p.fate === "qdrop") c.qdrop++; }
+    S.hist.push(c.ok / c.frames);
+    S.lastClosed = rec;
+    S.lastCmp = E.comparePolicies(ds, rec.f, rec.arrived, S.cfg.k, S.cmpRng);
+    for (const [k] of POL_ALL) { S.cmp[k].n++; if (S.lastCmp[k].correct) S.cmp[k].ok++; }
+    if (S.follow || !S.sel) {
+      const i = rec.admitted[0] ?? rec.arrived[0] ?? rec.order[0];
+      if (i != null) S.sel = { f: rec.f, i };
+      renderInspector();
+    }
+    renderReceiver(); renderCompare(); renderMeters(); narrate();
+    if (rec.f === ds.n - 1) finishRun();
+  }
+  function finishRun() {
+    S.ended = true; S.playing = false; syncPlay();
+    const m = S.preset != null ? D.measured.udp[S.preset] : null;
+    $("banner").hidden = false;
+    $("banner").innerHTML = `<b>All 300 frames done.</b> Accuracy <b>${fmtPct(S.cnt.ok / S.cnt.frames)}</b>` +
+      (m && S.cnt.frames === ds.n ? `. The real UDP run of this scenario measured <b>${fmtPct(m.accuracy)}</b>.` : ".") + " Press Restart to watch it again.";
+  }
+
+  /* ---------- plain-language narration of the last decided frame ---------- */
+  function list(a) { return a.length ? a.join(", ") : "none"; }
+  function narrate() {
+    const r = S.lastClosed, c = S.cfg;
+    if (!r) return;
+    const lost = r.pkts.filter(p => p.fate === "loss").length, qd = r.pkts.filter(p => p.fate === "qdrop").length;
+    const skipped = r.arrived.length - r.admitted.length;
+    let s = `<b>Frame ${r.f}</b> is a picture of a <b>${esc(className(r.label))}</b>. `;
+    s += c.feedback && r.pkts.length < P
+      ? `The receiver had told the sender its budget is ${c.k}, so the sender ranked its tiles and sent only ${r.pkts.length}: tiles ${list(r.order)}. `
+      : `The sender sent all ${r.pkts.length} tiles, row by row. `;
+    if (lost || qd) {
+      s += `On the link, ${lost ? `<span class="l">${lost} ${lost > 1 ? "were" : "was"} lost at random</span>` : ""}${lost && qd ? " and " : ""}${qd ? `<span class="q">${qd} ${qd > 1 ? "were" : "was"} thrown away because the queue was full</span>` : ""}, so ${r.arrived.length} arrived. `;
+    } else s += `Nothing was lost on the link, so all ${r.arrived.length} arrived. `;
+    if (r.arrived.length <= c.k) s += `That is within the budget of ${c.k}, so the receiver kept all of them. `;
+    else s += {
+      fifo: `The receiver can only afford ${c.k}, and FIFO simply kept the first ${c.k} to arrive (tiles ${list(r.admitted)}). `,
+      random: `The receiver can only afford ${c.k} and kept packets whose random score passed the threshold (tiles ${list(r.admitted)}). `,
+      tag: `The receiver can only afford ${c.k}. It scored each tag the moment it arrived and kept those above the threshold τ (tiles ${list(r.admitted)}). `,
+      ctx: `The receiver can only afford ${c.k}. It waited for the whole frame, scored all ${r.arrived.length} tags against each other with the context MLP, and kept the ${c.k} highest (tiles ${list(r.admitted)}). `,
+    }[c.policy];
+    if (skipped > 0) s += `<span class="c">${skipped} arrived but ${skipped > 1 ? "were" : "was"} skipped.</span> `;
+    s += r.admitted.length
+      ? `Looking only at those ${r.admitted.length} tiles (${r.cpuMs.toFixed(2)} ms of CPU), the CNN guessed <b>“${esc(className(r.pred))}”</b>: ${r.correct ? `<span class="ok">correct</span>.` : `<span class="bad">wrong</span>.`}`
+      : `No tiles were kept, so the frame counts as wrong.`;
+    $("narr").innerHTML = s;
+  }
+
+  function frame(now) {
+    const dt = Math.min(0.1, (now - S.wall) / 1000); S.wall = now;
+    if (S.playing && !S.ended) {
+      S.simT += dt * S.speed;
+      if (S.stepTarget != null && S.simT >= S.stepTarget) { S.simT = S.stepTarget; S.stepTarget = null; S.playing = false; syncPlay(); }
+    }
+    ensure(); closeFrames();
+    drawTopo(); renderSender();
+    $("clkT").textContent = S.simT.toFixed(3);
+    $("clkF").textContent = Math.min(ds.n, (S.lastClosed ? S.lastClosed.f + 1 : 0));
+    requestAnimationFrame(frame);
+  }
+
+  /* ---------- topology canvas ---------- */
+  const cvTopo = $("topo");
+  function layout(W) {
+    const sW = 150, lW = Math.max(230, W * 0.25), rW = Math.max(320, W * 0.38);
+    const gap = (W - 16 - sW - lW - rW) / 2;
+    const S_ = { x: 8, y: 48, w: sW, h: 128 };
+    const L = { x: S_.x + sW + gap, y: 48, w: lW, h: 128 };
+    const R = { x: L.x + lW + gap, y: 24, w: rW, h: 200 };
+    return { S: S_, L, R, y: 112, ry: 276 };
+  }
+  function rr(x, cx, cy, w, h, r) { x.beginPath(); x.roundRect(cx, cy, w, h, r); }
+  function box(x, b, badge, title, code) {
+    rr(x, b.x, b.y, b.w, b.h, 10); x.fillStyle = C.sunk; x.fill();
+    x.fillStyle = C.ink; x.beginPath(); x.arc(b.x + 18, b.y + 18, 9, 0, Math.PI * 2); x.fill();
+    x.fillStyle = C.surface; x.font = "600 10px 'IBM Plex Mono', monospace"; x.textAlign = "center"; x.fillText(badge, b.x + 18, b.y + 21.5); x.textAlign = "left";
+    x.fillStyle = C.ink; x.font = "600 14px 'IBM Plex Sans Condensed', sans-serif"; x.fillText(title, b.x + 34, b.y + 23);
+    const tw = x.measureText(title).width;
+    x.fillStyle = C.faint; x.font = "10px 'IBM Plex Mono', monospace"; x.fillText(code, b.x + 34 + tw + 8, b.y + 23);
+  }
+  function glyph(x, cx, cy, col, label, a = 1, s = 1) {
+    x.globalAlpha = a;
+    const w = 20 * s, h = 13 * s;
+    rr(x, cx - w / 2, cy - h / 2, w, h, 3); x.fillStyle = col; x.fill();
+    if (label != null && s >= 0.8 && S.speed <= 0.1) {
+      x.fillStyle = "#fff"; x.font = `600 ${9 * s}px 'IBM Plex Mono', monospace`; x.textAlign = "center";
+      x.fillText(label, cx, cy + 3.2 * s); x.textAlign = "left";
+    }
+    x.globalAlpha = 1;
+  }
+  function cross(x, cx, cy, col, a, r = 6) {
+    x.globalAlpha = a; x.strokeStyle = col; x.lineWidth = 2.2;
+    x.beginPath(); x.moveTo(cx - r, cy - r); x.lineTo(cx + r, cy + r); x.moveTo(cx + r, cy - r); x.lineTo(cx - r, cy + r); x.stroke();
+    x.globalAlpha = 1; x.lineWidth = 1;
+  }
+  const lerp = (a, b, t) => a + (b - a) * Math.max(0, Math.min(1, t));
+  const ease = t => { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); };
+  function label(x, txt, px, py, col = C.muted, font = "10.5px 'IBM Plex Sans', sans-serif") { x.fillStyle = col; x.font = font; x.fillText(txt, px, py); }
+
+  function drawTopo() {
+    const W = cvTopo.clientWidth, H = 300, x = hidpi(cvTopo, W, H), L_ = layout(W), { S: Sb, L, R, y } = L_;
+    x.clearRect(0, 0, W, H);
+    const cfg = S.cfg, t = S.simT, ctx = cfg.policy === "ctx";
+    const senderRec = [...S.frames].reverse().find(r => r.tFrame <= t) || S.frames[0];
+
+    // wires
+    x.strokeStyle = C.line; x.lineWidth = 2;
+    x.beginPath(); x.moveTo(Sb.x + Sb.w, y); x.lineTo(L.x, y); x.moveTo(L.x + L.w, y); x.lineTo(R.x, y); x.stroke();
+    x.setLineDash([4, 5]); x.strokeStyle = C.ctrl; x.globalAlpha = 0.45; x.lineWidth = 1.5;
+    const rx0 = R.x + R.w * 0.5, sx0 = Sb.x + Sb.w * 0.5;
+    x.beginPath(); x.moveTo(rx0, R.y + R.h); x.lineTo(rx0, L_.ry); x.lineTo(sx0, L_.ry); x.lineTo(sx0, Sb.y + Sb.h); x.stroke();
+    x.setLineDash([]); x.globalAlpha = 1; x.lineWidth = 1;
+    label(x, "UDP :6000", Sb.x + Sb.w + 10, y - 14, C.faint, "10px 'IBM Plex Mono', monospace");
+    label(x, "UDP :6001", L.x + L.w + 10, y - 14, C.faint, "10px 'IBM Plex Mono', monospace");
+    label(x, `SAEC feedback: “my budget is k = ${cfg.k}”, 10× per second · ${cfg.feedback ? "sender obeys" : "sender ignores it"}`, sx0 + 10, L_.ry - 7, C.ctrl);
+
+    // A sender
+    box(x, Sb, "A", "Sender", "sender.py");
+    if (senderRec) {
+      x.drawImage(frameImg(senderRec.f), Sb.x + 14, Sb.y + 40, 72, 72);
+      label(x, `frame ${senderRec.f}`, Sb.x + 94, Sb.y + 56, C.ink, "500 11px 'IBM Plex Mono', monospace");
+      label(x, `${senderRec.pkts.length} packets`, Sb.x + 94, Sb.y + 72);
+      label(x, cfg.feedback ? "best k only" : "row by row", Sb.x + 94, Sb.y + 87);
+    }
+
+    // B link
+    box(x, L, "B", "Link", "link_emulator.py");
+    const qN = 8, slot = Math.min(20, (L.w - 70) / qN), qx1 = L.x + L.w - 34, qx0 = qx1 - slot * qN, qy = y;
+    for (let i = 0; i < qN; i++) { rr(x, qx0 + i * slot + 1, qy - 9, slot - 2, 18, 3); x.strokeStyle = C.line; x.lineWidth = 1.2; x.stroke(); }
+    x.beginPath(); x.arc(qx1 + 14, qy, 8, 0, Math.PI * 2); x.strokeStyle = C.faint; x.stroke();
+    const rateTxt = cfg.rate > 0 ? `max ${Math.round(cfg.rate * OFFERED)} pkt/s` : "no capacity limit";
+    label(x, `random loss ${Math.round(cfg.loss * 100)}%  ·  ${rateTxt}`, L.x + 14, L.y + 44);
+    label(x, "queue (8 slots) → out", qx0, qy + 28, C.faint, "10px 'IBM Plex Sans', sans-serif");
+
+    // C receiver
+    box(x, R, "C", "Receiver", "receiver.py");
+    const peek = { x: R.x + 14, y: R.y + 44, w: 78, h: 50 };
+    const buf = { x: peek.x + peek.w + 14, y: R.y + 44, w: 84, h: 84 };
+    const cnn = { x: R.x + R.w - 128, y: R.y + 44, w: 114, h: 84 };
+    const tray = { x: buf.x, y: R.y + R.h - 50, w: cnn.x - buf.x - 8, h: 30 };
+    const sub = (b, l1, l2) => { rr(x, b.x, b.y, b.w, b.h, 6); x.fillStyle = C.surface; x.fill(); label(x, l1, b.x + 8, b.y + 16, C.ink, "600 11px 'IBM Plex Sans', sans-serif"); if (l2) label(x, l2, b.x + 8, b.y + 30, C.faint, "10px 'IBM Plex Sans', sans-serif"); };
+    sub(peek, "1 Read tag", "header + tag only");
+    rr(x, buf.x, buf.y, buf.w, buf.h, 6); x.fillStyle = C.surface; x.fill();
+    if (ctx) {
+      for (let i = 0; i < P; i++) { rr(x, buf.x + 6 + (i % G) * 19, buf.y + 6 + Math.floor(i / G) * 19, 16, 16, 3); x.strokeStyle = C.line; x.stroke(); }
+    } else {
+      label(x, "2 Choose", buf.x + 8, buf.y + 16, C.ink, "600 11px 'IBM Plex Sans', sans-serif");
+      const tau = S.lastClosed?.tau;
+      label(x, cfg.policy === "fifo" ? "first k win" : cfg.policy === "random" ? "random ≥ τ" : "score ≥ τ", buf.x + 8, buf.y + 34);
+      if (cfg.policy !== "fifo") label(x, `τ = ${tau == null || tau <= -(2 ** 31) ? "−∞" : tau}`, buf.x + 8, buf.y + 50, C.faint, "10px 'IBM Plex Mono', monospace");
+      label(x, `keep ${cfg.k} / frame`, buf.x + 8, buf.y + 68, C.faint, "10px 'IBM Plex Mono', monospace");
+    }
+    label(x, ctx ? "2 Buffer frame, rank all" : "", buf.x, buf.y + buf.h + 13, C.faint, "10px 'IBM Plex Sans', sans-serif");
+    sub(cnn, "3 Classify", "CNN, cost grows with k");
+    if (S.lastClosed) {
+      const lc = S.lastClosed;
+      label(x, `${lc.admitted.length} tiles · ${lc.cpuMs.toFixed(2)} ms`, cnn.x + 8, cnn.y + 50, C.muted, "10px 'IBM Plex Mono', monospace");
+      const nm = lc.pred >= 0 ? className(lc.pred) : "no tiles";
+      label(x, (lc.correct ? "✓ " : "✗ ") + nm.slice(0, 15), cnn.x + 8, cnn.y + 70, lc.correct ? C.ok : C.loss, "600 11.5px 'IBM Plex Sans', sans-serif");
+    }
+    rr(x, tray.x, tray.y, tray.w, tray.h, 6); x.strokeStyle = C.line; x.setLineDash([3, 3]); x.stroke(); x.setLineDash([]);
+    label(x, `skipped (${S.cnt.cdrop} so far)`, tray.x + 2, tray.y + tray.h + 13, C.faint, "10px 'IBM Plex Sans', sans-serif");
+
+    // SAEC control packets: receiver.py sends one every 100 ms
+    const seg1 = L_.ry - (R.y + R.h), seg2 = rx0 - sx0, seg3 = L_.ry - Sb.y - Sb.h, pathLen = seg1 + seg2 + seg3;
+    for (let k = Math.floor((t - 2 * HOP) / 0.1); k <= Math.floor(t / 0.1); k++) {
+      const ts = 0.02 + k * 0.1, u = (t - ts) / (2 * HOP);
+      if (k < 0 || u < 0 || u > 1) continue;
+      const d = u * pathLen;
+      let px, py;
+      if (d < seg1) { px = rx0; py = R.y + R.h + d; } else if (d < seg1 + seg2) { px = rx0 - (d - seg1); py = L_.ry; }
+      else { px = sx0; py = L_.ry - (d - seg1 - seg2); }
+      glyph(x, px, py, C.ctrl, "k", 1, 0.85);
+    }
+
+    // data packets
+    const queued = [];
+    const sIn = Sb.x + Sb.w, lIn = qx0 - 6;
+    for (const rec of S.frames) {
+      for (const p of rec.pkts) {
+        if (t < p.tSend) continue;
+        const lbl = String(p.idx);
+        if (t < p.tLink) { glyph(x, lerp(sIn, lIn, (t - p.tSend) / HOP), y, C.pkt, lbl); continue; }
+        if (p.fate === "loss") {
+          const u = (t - p.tLink) / 0.014;
+          if (u < 1) { glyph(x, lIn, y + 34 * ease(u), C.loss, lbl, 1 - u); cross(x, lIn, y + 34 * ease(u), C.loss, 1 - u); }
+          continue;
+        }
+        if (p.fate === "qdrop") {
+          const u = (t - p.tLink) / 0.014;
+          if (u < 1) glyph(x, lIn - 10 * u, y - 30 * ease(u), C.qdrop, lbl, 1 - u);
+          continue;
+        }
+        if (t < p.tDepart) { queued.push(p); continue; }
+        if (t < p.tRecv) { glyph(x, lerp(qx1 + 14, R.x + 6, (t - p.tDepart) / HOP), y, C.pkt, lbl); continue; }
+        const pk = { x: peek.x + peek.w / 2, y: peek.y + peek.h - 12 };
+        const tDecide = ctx ? rec.tClose : p.tRecv + 0.004;
+        const slotPos = { x: buf.x + 14 + (p.idx % G) * 19, y: buf.y + 14 + Math.floor(p.idx / G) * 19 };
+        const cnnPos = { x: cnn.x + cnn.w - 18, y: cnn.y + 14 };
+        const trayPos = { x: tray.x + 14 + (p.idx % 8) * ((tray.w - 28) / 7), y: tray.y + tray.h / 2 };
+        if (t < p.tRecv + 0.004) {
+          const u = ease((t - p.tRecv) / 0.004);
+          glyph(x, lerp(R.x + 6, pk.x, u), lerp(y, pk.y, u), C.pkt, lbl);
+          continue;
+        }
+        if (t < tDecide) {
+          const u = ease((t - p.tRecv - 0.004) / 0.004);
+          glyph(x, lerp(pk.x, slotPos.x, u), lerp(pk.y, slotPos.y, u), C.pkt, null, 1, 0.75);
+          continue;
+        }
+        const from = ctx ? slotPos : pk, u = (t - tDecide) / 0.008;
+        if (p.decision === "admit") {
+          if (u < 1) glyph(x, lerp(from.x, cnnPos.x, ease(u)), lerp(from.y, cnnPos.y, ease(u)), C.ok, lbl);
+          else if (u < 2) glyph(x, cnnPos.x, cnnPos.y, C.ok, lbl, 2 - u);
+        } else {
+          if (u < 1) glyph(x, lerp(from.x, trayPos.x, ease(u)), lerp(from.y, trayPos.y, ease(u)), C.cdrop, lbl);
+          else if (u < 3) glyph(x, trayPos.x, trayPos.y, C.cdrop, lbl, (3 - u) / 2);
+        }
+      }
+    }
+    queued.sort((a, b) => a.tLink - b.tLink);
+    queued.forEach((p, j) => glyph(x, qx1 - slot / 2 - j * slot, qy, C.pkt, String(p.idx), 1, Math.min(1, (slot - 2) / 20)));
+  }
+
+  /* ---------- sender panel ---------- */
+  function tileRect(i, size) { const s = size / G; return [(i % G) * s, Math.floor(i / G) * s, s]; }
+  function renderSender() {
+    const t = S.simT, rec = [...S.frames].reverse().find(r => r.tFrame <= t) || S.frames[0];
+    if (!rec) return;
+    const cv = $("sendCv"), sz = 200, x = hidpi(cv, sz, sz);
+    x.drawImage(frameImg(rec.f), 0, 0, sz, sz);
+    const sent = new Map(rec.pkts.map(p => [p.idx, p]));
+    for (let i = 0; i < P; i++) {
+      const [tx, ty, s] = tileRect(i, sz), p = sent.get(i);
+      if (!p) { x.fillStyle = C.bg; x.globalAlpha = 0.8; x.fillRect(tx, ty, s, s); x.globalAlpha = 1; continue; }
+      if (t < p.tSend) { x.fillStyle = C.bg; x.globalAlpha = 0.5; x.fillRect(tx, ty, s, s); x.globalAlpha = 1; }
+      else if (t >= p.tLink && p.fate !== "ok") {
+        const col = p.fate === "loss" ? C.loss : C.qdrop;
+        cross(x, tx + s / 2, ty + s / 2, col, 1, 9); x.strokeStyle = col; x.lineWidth = 2; x.strokeRect(tx + 1, ty + 1, s - 2, s - 2); x.lineWidth = 1;
+      }
+      x.fillStyle = "rgba(0,0,0,0.45)"; x.fillRect(tx + 3, ty + 3, 15, 12);
+      x.fillStyle = "#fff"; x.font = "500 9px 'IBM Plex Mono', monospace"; x.fillText(String(i), tx + 5, ty + 12);
+    }
+    x.strokeStyle = "rgba(255,255,255,0.25)";
+    for (let g = 1; g < G; g++) { const q = g * sz / G; x.beginPath(); x.moveTo(q, 0); x.lineTo(q, sz); x.moveTo(0, q); x.lineTo(sz, q); x.stroke(); }
+    if (S.sel && S.sel.f === rec.f) { const [tx, ty, s] = tileRect(S.sel.i, sz); x.strokeStyle = C.accent; x.lineWidth = 2.5; x.strokeRect(tx + 1, ty + 1, s - 2, s - 2); x.lineWidth = 1; }
+    $("sF").textContent = rec.f;
+    $("sMode").textContent = S.cfg.feedback ? `sending its best ${rec.senderBudget}` : "sending all 16, row by row";
+    $("sLabel").textContent = className(rec.label);
+    $("sOrder").textContent = rec.order.join(" ");
+    $("sPace").textContent = `one 248 B packet every ${(PERIOD / rec.pkts.length * 1000).toFixed(1)} ms`;
+    if (renderSender.f !== rec.f) { renderSender.f = rec.f; drawTagmap(rec.f); }
+  }
+  function drawTagmap(f) {
+    const cv = $("tagmap"), x = cv.getContext("2d"), id = x.createImageData(32, 16);
+    const neg = [36, 89, 201], pos = [201, 138, 31], mid = [140, 140, 140];
+    for (let r = 0; r < 16; r++) {
+      const tg = ds.tag(f, r);
+      for (let c = 0; c < 32; c++) {
+        const v = Math.max(-1, Math.min(1, tg[c] / 60)), a = Math.abs(v), col = v < 0 ? neg : pos, o = (r * 32 + c) * 4;
+        for (let ch = 0; ch < 3; ch++) id.data[o + ch] = Math.round(mid[ch] * (1 - a) + col[ch] * a);
+        id.data[o + 3] = 255;
+      }
+    }
+    x.putImageData(id, 0, 0);
+  }
+
+  /* ---------- receiver panel ---------- */
+  function drawDecision(cv, sz, f, arrived, admitted, sentSet, scores) {
+    const x = hidpi(cv, sz, sz);
+    x.fillStyle = C.sunk; x.fillRect(0, 0, sz, sz);
+    const img = frameImg(f), arr = new Set(arrived), adm = new Set(admitted), big = sz > 150;
+    for (let i = 0; i < P; i++) {
+      const [tx, ty, s] = tileRect(i, sz), sxs = (i % G) * 8, sys = Math.floor(i / G) * 8;
+      if (adm.has(i)) { x.drawImage(img, sxs, sys, 8, 8, tx, ty, s, s); x.strokeStyle = C.ok; x.lineWidth = big ? 2.5 : 1.5; x.strokeRect(tx + 1, ty + 1, s - 2, s - 2); }
+      else if (arr.has(i)) {
+        x.globalAlpha = 0.18; x.drawImage(img, sxs, sys, 8, 8, tx, ty, s, s); x.globalAlpha = 0.6;
+        x.strokeStyle = C.cdrop; x.lineWidth = 1; x.save(); x.beginPath(); x.rect(tx, ty, s, s); x.clip();
+        for (let d = -s; d < s; d += 7) { x.beginPath(); x.moveTo(tx + d, ty + s); x.lineTo(tx + d + s, ty); x.stroke(); }
+        x.restore(); x.globalAlpha = 1;
+      } else if (sentSet && !sentSet.has(i)) {
+        x.fillStyle = C.faint; x.font = `${big ? 12 : 9}px 'IBM Plex Mono', monospace`; x.textAlign = "center"; x.fillText("—", tx + s / 2, ty + s / 2 + 4); x.textAlign = "left";
+      } else cross(x, tx + s / 2, ty + s / 2, C.loss, 0.65, big ? 7 : 4);
+      x.lineWidth = 1;
+      if (scores && scores[i] != null && big) {
+        const v = scores[i], txt = Math.abs(v) >= 1000 ? String(Math.round(v)) : v.toFixed(2);
+        x.fillStyle = "rgba(0,0,0,0.55)"; x.fillRect(tx + 3, ty + s - 15, x.measureText(txt).width + 8, 12);
+        x.fillStyle = "#fff"; x.font = "9px 'IBM Plex Mono', monospace"; x.fillText(txt, tx + 6, ty + s - 6);
+      }
+    }
+  }
+  function renderReceiver() {
+    const rec = S.lastClosed;
+    if (!rec || !C.ink) return;
+    const cfg = S.cfg;
+    drawDecision($("recvCv"), 200, rec.f, rec.arrived, rec.admitted, new Set(rec.order), rec.scores);
+    if (S.sel && S.sel.f === rec.f) { const x = $("recvCv").getContext("2d"), [tx, ty, s] = tileRect(S.sel.i, 200); x.strokeStyle = C.accent; x.lineWidth = 2.5; x.strokeRect(tx + 1, ty + 1, s - 2, s - 2); x.lineWidth = 1; }
+    $("rF").textContent = rec.f;
+    $("rVerdict").innerHTML = rec.correct ? `<span style="color:var(--ok)">✓ correct</span>` : `<span style="color:var(--loss)">✗ wrong</span>`;
+    $("rCounts").textContent = `${rec.arrived.length} of ${rec.pkts.length} arrived · kept ${rec.admitted.length} (budget ${cfg.k})`;
+    $("rCpu").textContent = `${rec.cpuMs.toFixed(2)} ms (all 16 tiles would take ${ds.cpuMs(16).toFixed(2)} ms)`;
+    $("rScoreLbl").textContent = { ctx: "Score: context MLP", tag: "Score: integer formula on the tag", random: "Score: random number", fifo: "Score" }[cfg.policy];
+    $("rScore").textContent = cfg.policy === "fifo" ? "none, arrival order decides" : cfg.policy === "ctx" ? "compared within the frame, top k kept" : `kept if ≥ τ = ${rec.tau <= -(2 ** 31) ? "−∞ (still calibrating)" : rec.tau}`;
+    const truthIn = rec.top.some(o => o.c === rec.label);
+    $("rBars").innerHTML = rec.top.map(o => `<div class="bar${o.c === rec.label ? " truth" : ""}"><div class="track"><div class="fill" style="width:${(o.p * 100).toFixed(1)}%"></div><div class="name">${esc(className(o.c))}${o.c === rec.label ? " · true label" : ""}</div></div><span class="v">${(o.p * 100).toFixed(1)}%</span></div>`).join("") +
+      (truthIn ? "" : `<div class="small muted">The true label, ${esc(className(rec.label))}, is not in the top 3.</div>`);
+  }
+
+  /* ---------- compare strip ---------- */
+  function buildCompare() {
+    $("cmp").innerHTML = POL_ALL.map(([k, nm]) => `<div class="pol" id="pol-${k}"><div class="nm"><i class="dot" style="background:var(--${k})"></i>${nm}</div>
+      <div class="how">${POL_HOW[k]}</div>
+      <canvas id="pcv-${k}" width="130" height="130"></canvas><div class="pred" id="ppred-${k}">–</div><div class="run" id="prun-${k}">–</div></div>`).join("");
+  }
+  function renderCompare() {
+    const rec = S.lastClosed, cm = S.lastCmp;
+    if (!rec || !cm || !C.ink) return;
+    for (const [k] of POL_ALL) {
+      const cv = $("pcv-" + k), w = cv.clientWidth || 120;
+      drawDecision(cv, w, rec.f, rec.arrived, cm[k].admitted, new Set(rec.order), null);
+      const r = cm[k];
+      $("ppred-" + k).innerHTML = `<span style="color:var(--${r.correct ? "ok" : "loss"})">${r.correct ? "✓" : "✗"}</span> ${r.pred >= 0 ? esc(className(r.pred)) : "no tiles"}`;
+      const t = S.cmp[k];
+      $("prun-" + k).innerHTML = `<b>${fmtPct(t.ok / Math.max(t.n, 1))}</b> over ${t.n} frame${t.n === 1 ? "" : "s"}`;
+      $("pol-" + k).classList.toggle("cur", k === S.cfg.policy);
+    }
+    $("cmpN").textContent = `Frame ${rec.f} (${className(rec.label)}): ${rec.arrived.length} packets arrived, budget k = ${S.cfg.k}.` +
+      (S.cfg.feedback ? " With feedback on, the sender already sent only its best tiles, so the policies have little left to choose between." : "");
+  }
+
+  /* ---------- meters ---------- */
+  function renderMeters() {
+    if (!S.cnt || !C.ink) return;
+    const c = S.cnt, n = Math.max(c.frames, 1);
+    $("mFrames").textContent = c.frames;
+    $("mSent").textContent = c.sent;
+    $("mSentS").textContent = `${(c.sent * 248 / 1024).toFixed(1)} kB of traffic`;
+    $("mLoss").textContent = c.loss; $("mQ").textContent = c.qdrop; $("mC").textContent = c.cdrop;
+    $("mAdm").textContent = (c.adm / n).toFixed(1);
+    $("mCpu").textContent = `${(c.cpu / n).toFixed(2)} ms CPU per frame`;
+    $("mAcc").textContent = c.frames ? fmtPct(c.ok / n) : "–";
+    $("mAccS").textContent = `${c.ok} of ${c.frames} correct · best case (all 16 tiles): ${fmtPct(D.ref.acc_all16)}`;
+    const cv = $("spark"), W = cv.clientWidth || 300, H = 40, x = hidpi(cv, W, H);
+    x.clearRect(0, 0, W, H);
+    const yOf = v => H - 3 - v / 0.7 * (H - 6);
+    x.strokeStyle = C.faint; x.setLineDash([3, 3]); x.beginPath(); x.moveTo(0, yOf(D.ref.acc_all16)); x.lineTo(W, yOf(D.ref.acc_all16)); x.stroke(); x.setLineDash([]);
+    const h = S.hist;
+    if (h.length > 1) {
+      x.beginPath();
+      h.forEach((v, i) => { const px = i / (h.length - 1) * (W - 4) + 2; i ? x.lineTo(px, yOf(v)) : x.moveTo(px, yOf(v)); });
+      x.strokeStyle = C.accent; x.lineWidth = 1.6; x.stroke(); x.lineWidth = 1;
+      x.fillStyle = C.accent; x.beginPath(); x.arc(W - 2, yOf(h.at(-1)), 2.5, 0, Math.PI * 2); x.fill();
+    }
+  }
+
+  /* ---------- packet inspector ---------- */
+  const FIELDS = [
+    [0, 4, "magic", "marks this as a SAEP packet", b => `"${String.fromCharCode(...b)}"`, 1],
+    [4, 1, "version", "protocol version", b => b[0], 2],
+    [5, 1, "flags", "first / last packet of the frame", b => `0x${b[0].toString(16).padStart(2, "0")}${b[0] & 1 ? " FIRST" : ""}${b[0] & 2 ? " LAST" : ""}`, 1],
+    [6, 2, "header_len", "where the pixels start", b => (b[0] << 8 | b[1]) + " B", 2],
+    [8, 4, "frame_id", "which image", b => ((b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]) >>> 0), 1],
+    [12, 1, "pkt_index", "which tile", b => `${b[0]} (row ${Math.floor(b[0] / G)}, col ${b[0] % G})`, 2],
+    [13, 1, "pkt_count", "tiles per frame", b => b[0], 1],
+    [14, 1, "tag_dim", "tag length", b => b[0] + " B", 2],
+    [15, 1, "tag_dtype", "tag number type", b => b[0] + " = int8", 1],
+    [16, 2, "tag_scheme_id", "which tag model made it", b => b[0] << 8 | b[1], 2],
+    [18, 2, "payload_len", "pixel bytes", b => (b[0] << 8 | b[1]) + " B (8×8×3)", 1],
+    [20, 4, "payload_crc32", "checksum of the pixels", b => "0x" + [...b].map(v => v.toString(16).padStart(2, "0")).join(""), 2],
+    [24, 32, "tag", "the semantic summary", b => "[" + [...new Int8Array(b.buffer, b.byteOffset, 6)].join(", ") + ", …]", 3],
+    [56, 192, "payload", "the tile's RGB pixels", () => "64 pixels × 3 colours", 0],
+  ];
+  const CFIELDS = [
+    [0, 4, "magic", "marks a control packet", b => `"${String.fromCharCode(...b)}"`, 1],
+    [4, 1, "version", "protocol version", b => b[0], 2],
+    [5, 1, "flags", "unused", b => b[0], 1],
+    [6, 2, "budget_per_frame", "the receiver's k", b => (b[0] << 8 | b[1]) + " tiles", 2],
+    [8, 4, "threshold", "current τ (int32)", b => { const v = new DataView(b.buffer, b.byteOffset, 4).getInt32(0); return v <= -(2 ** 31) ? v + " (−∞)" : v; }, 1],
+    [12, 1, "query_dim", "optional query vector", b => b[0] + " (none)", 2],
+  ];
+  function fieldBg(kind) { return kind === 1 ? C["hex-hdr1"] : kind === 2 ? C["hex-hdr2"] : kind === 3 ? C["hex-tag"] : "transparent"; }
+  function renderInspector() {
+    if (!C.ink) return;
+    let bytes, fields, title, zones;
+    if (S.tab === "ctrl") {
+      const tau = S.lastClosed?.tau ?? -(2 ** 31);
+      bytes = E.encodeControl(S.cfg.k, tau); fields = CFIELDS;
+      title = `· receiver → sender, ${bytes.length} bytes`;
+      zones = [["SAEC header · 13 B", 13, C["hex-hdr1"]]];
+    } else {
+      if (!S.sel) return;
+      bytes = ds.encodePacket(S.sel.f, S.sel.i); fields = FIELDS;
+      title = `· frame ${S.sel.f}, tile ${S.sel.i}, ${bytes.length} bytes`;
+      zones = [["header 24 B", 24, C["hex-hdr1"]], ["tag 32 B", 32, C["hex-tag"]], ["pixels 192 B", 192, C.sunk]];
+    }
+    $("iTitle").textContent = title;
+    $("zones").innerHTML = zones.map(([t, n, bg]) => `<div style="flex:${n};background:${bg}" title="${t}">${t}</div>`).join("");
+    const kindAt = new Array(bytes.length).fill(0);
+    for (const [o, n, , , , k] of fields) for (let j = o; j < o + n; j++) kindAt[j] = k;
+    let html = "";
+    for (let r = 0; r < bytes.length; r += 16) {
+      let hx = "", asc = "";
+      for (let j = r; j < Math.min(r + 16, bytes.length); j++) {
+        hx += `<span class="b" data-o="${j}" style="background:${fieldBg(kindAt[j])}">${bytes[j].toString(16).padStart(2, "0")}</span>${j % 8 === 7 ? "  " : " "}`;
+        asc += bytes[j] >= 32 && bytes[j] < 127 ? esc(String.fromCharCode(bytes[j])) : ".";
+      }
+      html += `<div class="row"><span class="off">${r.toString(16).padStart(4, "0")}</span><span>${hx}</span><span class="asc">${asc}</span></div>`;
+    }
+    $("hex").innerHTML = html;
+    $("fields").innerHTML = fields.map(([o, n, nm, what, fmt, k]) =>
+      `<tr data-o="${o}" data-n="${n}"><td>${o}${n > 1 ? "–" + (o + n - 1) : ""}</td><td><i class="key" style="background:${fieldBg(k)}"></i>${nm}<br><span class="muted" style="font-size:0.74rem">${what}</span></td><td>${fmt(bytes.subarray(o, o + n))}</td></tr>`).join("");
+  }
+  $("fields").addEventListener("mouseover", e => {
+    const tr = e.target.closest("tr[data-o]");
+    document.querySelectorAll("#hex .b.on").forEach(el => el.classList.remove("on"));
+    if (!tr) return;
+    const o = +tr.dataset.o, n = +tr.dataset.n;
+    for (let j = o; j < o + n; j++) document.querySelector(`#hex .b[data-o="${j}"]`)?.classList.add("on");
+  });
+  function pickTile(cv, getF) {
+    cv.addEventListener("click", e => {
+      const r = cv.getBoundingClientRect(), f = getF();
+      if (f == null) return;
+      const i = Math.floor((e.clientY - r.top) / r.height * G) * G + Math.floor((e.clientX - r.left) / r.width * G);
+      S.sel = { f, i }; S.tab = "data"; syncTabs(); renderInspector(); renderReceiver();
+    });
+  }
+  pickTile($("sendCv"), () => ([...S.frames].reverse().find(r => r.tFrame <= S.simT) || S.frames[0])?.f);
+  pickTile($("recvCv"), () => S.lastClosed?.f);
+  function syncTabs() { $("tabData").setAttribute("aria-selected", S.tab === "data"); $("tabCtrl").setAttribute("aria-selected", S.tab === "ctrl"); }
+  $("tabData").onclick = () => { S.tab = "data"; syncTabs(); renderInspector(); };
+  $("tabCtrl").onclick = () => { S.tab = "ctrl"; syncTabs(); renderInspector(); };
+  $("followIn").onchange = e => { S.follow = e.target.checked; };
+
+  /* ---------- controls ---------- */
+  function buildControls() {
+    $("presets").innerHTML = E.SCENARIOS.map((s, i) => `<button class="chip" type="button" data-i="${i}" aria-pressed="false" title="${esc(s.name)}">${SCEN[i][0]}</button>`).join("");
+    $("presets").onclick = e => { const b = e.target.closest(".chip"); if (!b) return; S.preset = +b.dataset.i; S.cfg = presetCfg(S.preset); rebuild(0); play(true); };
+    $("policySeg").innerHTML = POL.map(([k, nm]) => `<button type="button" data-k="${k}" aria-pressed="false">${nm}</button>`).join("");
+    $("policySeg").onclick = e => { const b = e.target.closest("button"); if (!b) return; change({ policy: b.dataset.k }); };
+    $("kIn").oninput = e => change({ k: +e.target.value });
+    $("lossIn").oninput = e => change({ loss: +e.target.value / 100 });
+    $("rateIn").oninput = e => change({ rate: +e.target.value / 100 });
+    $("fbIn").onchange = e => change({ feedback: e.target.checked });
+    $("timerIn").onchange = e => change({ ideal: e.target.value === "ideal" });
+  }
+  function change(patch) {
+    Object.assign(S.cfg, patch);
+    const match = E.SCENARIOS.findIndex(s => s.k === S.cfg.k && s.policy === S.cfg.policy && Math.abs(s.loss - S.cfg.loss) < 1e-9 && Math.abs(s.rate - S.cfg.rate) < 1e-9 && s.feedback === S.cfg.feedback);
+    S.preset = match >= 0 && !S.cfg.ideal ? match : null;
+    rebuild(S.lastClosed ? S.lastClosed.f + 1 : 0);
+  }
+  function syncControls() {
+    const c = S.cfg;
+    document.querySelectorAll("#presets .chip").forEach(b => b.setAttribute("aria-pressed", +b.dataset.i === S.preset));
+    document.querySelectorAll("#policySeg button").forEach(b => b.setAttribute("aria-pressed", b.dataset.k === c.policy));
+    $("polHelp").textContent = POL_HELP[c.policy];
+    $("kIn").value = c.k; $("kOut").textContent = `${c.k} of 16`;
+    $("lossIn").value = Math.round(c.loss * 100); $("lossOut").textContent = `${Math.round(c.loss * 100)}%`;
+    $("rateIn").value = Math.round(c.rate * 100);
+    $("rateOut").textContent = c.rate > 0 ? `${Math.round(c.rate * OFFERED)} pkt/s (${Math.round(c.rate * 100)}%)` : "off";
+    $("fbIn").checked = c.feedback; $("timerIn").value = c.ideal ? "ideal" : "win";
+    if (S.preset != null) { $("scenT").textContent = SCEN[S.preset][0]; $("scenD").textContent = SCEN[S.preset][1]; }
+    else {
+      $("scenT").textContent = "Custom settings";
+      $("scenD").textContent = `Budget k = ${c.k}, ${Math.round(c.loss * 100)}% random loss, ${c.rate > 0 ? `link limited to ${Math.round(c.rate * OFFERED)} packets/s` : "no capacity limit"}, ${c.feedback ? "sender obeys feedback" : "sender ignores feedback"}. ${POL_HELP[c.policy]}`;
+    }
+  }
+  function syncPlay() { $("playBtn").textContent = S.playing ? "Pause" : "Play"; }
+  function play(on) { S.playing = on; if (on) S.wall = performance.now(); syncPlay(); }
+  $("playBtn").onclick = () => { if (S.ended) rebuild(0); play(!S.playing); };
+  $("restartBtn").onclick = () => { rebuild(0); play(true); };
+  $("stepBtn").onclick = () => {
+    if (S.ended) return;
+    ensure();
+    const nxt = S.frames[S.ci];
+    if (nxt) { S.stepTarget = nxt.tClose; play(true); }
+  };
+  $("speedIn").onchange = e => { S.speed = +e.target.value; };
+
+  /* ---------- validation: the nine run_demo.py scenarios through this engine ---------- */
+  function buildValidation() {
+    const tb = $("vt").querySelector("tbody");
+    tb.innerHTML = E.SCENARIOS.map((s, i) => {
+      const m = D.measured.udp[i];
+      return `<tr data-i="${i}"><td>${SCEN[i][0]}<br><span class="muted mono" style="font-size:0.72rem">${esc(s.name)}</span></td><td class="n">${fmtPct(m.accuracy)}</td><td class="n" id="vj${i}">…</td><td class="n" id="vl${i}">${m.link.forwarded} / –</td><td><button class="load" type="button" data-i="${i}">Watch</button></td></tr>`;
+    }).join("");
+    tb.onclick = e => { const b = e.target.closest(".load"); if (!b) return; S.preset = +b.dataset.i; S.cfg = presetCfg(S.preset); rebuild(0); play(true); $("h-wire").scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "start" }); };
+    let i = 0, exactOk = 0, exactN = 0, allOk = true;
+    const stepRun = () => {
+      const sc = E.SCENARIOS[i], js = new E.Simulation(ds, sc).runAll(), m = D.measured.udp[i];
+      const exact = sc.loss === 0 && sc.rate === 0 && sc.policy !== "random";
+      const diff = Math.abs(js.accuracy - m.accuracy), ok = exact ? diff < 1e-9 : diff <= 0.05;
+      if (exact) { exactN++; if (ok) exactOk++; }
+      if (!ok) allOk = false;
+      $("vj" + i).innerHTML = `${fmtPct(js.accuracy)} <span class="pill ${ok ? "good" : "bad"}" title="${exact ? "No randomness: must match exactly" : "Involves chance: expected within a few points"}">${exact && ok ? "exact" : "Δ " + (diff * 100).toFixed(1)}</span>`;
+      $("vl" + i).textContent = `${m.link.forwarded} / ${js.received}`;
+      if (++i < E.SCENARIOS.length) setTimeout(stepRun, 0);
+      else {
+        const pill = $("parityPill");
+        pill.className = "pill " + (allOk ? "good" : "bad");
+        pill.textContent = allOk ? `matches the real UDP run (${exactOk}/${exactN} exact, see step 7)` : "differs from the real UDP run, see step 7";
+      }
+    };
+    setTimeout(stepRun, 50);
+  }
+  function markValidationRow() { document.querySelectorAll("#vt tbody tr").forEach(tr => tr.classList.toggle("cur", +tr.dataset.i === S.preset)); drawChart(); }
+
+  function drawChart() {
+    const svg = $("chart"); if (!svg || !C.ink || !S.cfg) return;
+    const ob = D.measured.offline_budget, W = 560, H = 330, m = { l: 46, r: 118, t: 30, b: 42 };
+    const xs = k => m.l + (k - 1) / 15 * (W - m.l - m.r), ys = v => H - m.b - v / 0.8 * (H - m.t - m.b);
+    const lines = [["fifo", "FIFO", "fifo"], ["random", "Random", "random"], ["tag", "int8 tag", "tag"], ["tag+ctx_mlp", "Ctx MLP", "ctx"], ["oracle", "Oracle", "oracle"]];
+    let g = "";
+    g += `<text x="${m.l}" y="16" fill="${C.ink}" font-family="IBM Plex Sans Condensed, sans-serif" font-weight="600" font-size="14">Accuracy vs budget k, ${D.measured.offline_n.toLocaleString()} test images</text>`;
+    for (let v = 0; v <= 0.8001; v += 0.2) {
+      g += `<line x1="${m.l}" x2="${W - m.r}" y1="${ys(v)}" y2="${ys(v)}" stroke="${C.line}" stroke-width="1"/>`;
+      g += `<text x="${m.l - 8}" y="${ys(v) + 4}" text-anchor="end" fill="${C.muted}" font-family="IBM Plex Mono, monospace" font-size="11">${Math.round(v * 100)}%</text>`;
+    }
+    for (const k of [1, 4, 8, 12, 16]) g += `<text x="${xs(k)}" y="${H - m.b + 18}" text-anchor="middle" fill="${C.muted}" font-family="IBM Plex Mono, monospace" font-size="11">${k}</text>`;
+    g += `<text x="${(m.l + W - m.r) / 2}" y="${H - 6}" text-anchor="middle" fill="${C.muted}" font-family="IBM Plex Sans, sans-serif" font-size="12">tiles the receiver can process per frame (k)</text>`;
+    const kx = xs(S.cfg.k);
+    g += `<line x1="${kx}" x2="${kx}" y1="${m.t}" y2="${H - m.b}" stroke="${C.accent}" stroke-width="1.2" stroke-dasharray="3 3"/>`;
+    g += `<text x="${kx + 4}" y="${m.t + 10}" fill="${C.accent}" font-family="IBM Plex Mono, monospace" font-size="11">k=${S.cfg.k}</text>`;
+    const ends = [];
+    for (const [key, nm, tok] of lines) {
+      const v = ob[key]; if (!v) continue;
+      const pts = v.map((a, j) => `${xs(j + 1).toFixed(1)},${ys(a).toFixed(1)}`).join(" ");
+      const hero = tok === "ctx";
+      g += `<polyline points="${pts}" fill="none" stroke="${C[tok]}" stroke-width="${hero ? 2.6 : 1.5}" ${tok === "oracle" ? 'stroke-dasharray="5 4"' : ""}/>`;
+      const a = v[S.cfg.k - 1];
+      g += `<circle cx="${kx}" cy="${ys(a)}" r="${hero ? 4 : 3}" fill="${C[tok]}"/>`;
+      ends.push({ y0: ys(a), nm: `${nm} ${(a * 100).toFixed(1)}`, col: C[tok] });
+    }
+    ends.sort((a, b) => a.y0 - b.y0);
+    let last = -1e9;
+    for (const e of ends) { const yy = Math.max(e.y0 + 4, last + 15); last = yy; g += `<text x="${W - m.r + 8}" y="${yy}" fill="${e.col}" font-family="IBM Plex Mono, monospace" font-size="11">${e.nm}</text>`; }
+    svg.innerHTML = g;
+  }
+
+  /* ---------- boot ---------- */
+  buildControls(); buildCompare();
+  S.cfg = presetCfg(S.preset);
+  rebuild(0);
+  readTokens();
+  ensure(); S.simT = S.sim.wire[2].tFrame + 0.6 * PERIOD; ensure(); closeFrames();
+  syncPlay(); renderInspector(); renderMeters(); drawChart(); buildValidation();
+  window.addEventListener("resize", () => { renderReceiver(); renderCompare(); renderMeters(); });
+  requestAnimationFrame(t => { S.wall = t; requestAnimationFrame(frame); });
+})();
+</script>
