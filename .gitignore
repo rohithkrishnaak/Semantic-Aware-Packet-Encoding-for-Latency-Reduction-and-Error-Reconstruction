@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 viz/data.js
 viz/SAEP_Simulator.html
+viz/data_v3.js
+viz/SAEP_Simulator_v3.html

@@ -230,7 +230,8 @@ pre.cmd { font: 0.8rem/1.6 var(--f-mono); background: var(--surface); padding: 1
       <div><b>Success = correct label</b>A small CNN classifies the image from the admitted tiles only. Better choices mean more correct answers for the same CPU.</div>
     </div>
     <div class="prov">
-      <span><b>300</b> CIFAR-100 test images</span><span>weights from <b>artifacts/</b></span>
+      <span id="modelPill" class="pill"></span>
+      <span><b>300</b> CIFAR-100 test images</span><span>weights from <b id="artDir">artifacts/</b></span>
       <span id="parityPill" class="pill">checking against the real UDP run…</span>
     </div>
   </header>
@@ -238,7 +239,7 @@ pre.cmd { font: 0.8rem/1.6 var(--f-mono); background: var(--surface); padding: 1
   <!-- 1. scenario -->
   <section class="step" aria-labelledby="h-scen">
     <div class="step-head"><span class="num">1</span><h2 id="h-scen">Choose a scenario</h2>
-      <p class="explain">These are the nine experiments the project ran over real UDP sockets (<code>scripts/run_demo.py</code>). Pick one and the animation below restarts with it.</p></div>
+      <p class="explain">These are the experiments the project ran over real UDP sockets (<code>scripts/run_demo.py</code>). Pick one and the animation below restarts with it.</p></div>
     <div class="card">
       <div class="presets" id="presets" role="group" aria-label="Scenarios"></div>
       <div class="scen-desc" id="scenDesc" aria-live="polite"><span class="t" id="scenT"></span><span class="d" id="scenD"></span></div>
@@ -269,6 +270,11 @@ pre.cmd { font: 0.8rem/1.6 var(--f-mono); background: var(--surface); padding: 1
             <span class="lbl">Feedback to the sender</span>
             <label class="check" for="fbIn"><input type="checkbox" id="fbIn"> Sender obeys SAEC and sends only its top k</label>
             <span class="help">The receiver tells the sender its budget every 100 ms. The sender can then skip tiles that would be wasted.</span>
+          </div>
+          <div class="knob" id="exitKnob" hidden>
+            <span class="lbl">Early exit (v3)</span>
+            <label class="check" for="exitIn"><input type="checkbox" id="exitIn"> Vary k per frame, same average</label>
+            <span class="help">The receiver processes k−1 tiles, then adds one at a time until the CNN is confident, up to 2k. On average it still uses about k tiles. Only with the context MLP.</span>
           </div>
           <div class="knob">
             <label class="lbl" for="timerIn">Link timing model</label>
@@ -411,7 +417,7 @@ pre.cmd { font: 0.8rem/1.6 var(--f-mono); background: var(--surface); padding: 1
   <!-- 7. validation -->
   <section class="step" aria-labelledby="h-val">
     <div class="step-head"><span class="num">7</span><h2 id="h-val">Can this simulation be trusted?</h2>
-      <p class="explain">Each of the nine scenarios is run here in the browser over all 300 frames and compared with what the real Python programs measured over real UDP sockets (<code>artifacts/demo_results.json</code>). The chart shows the larger offline experiment on all 10,000 test images.</p></div>
+      <p class="explain">Each scenario is run here in the browser over all 300 frames and compared with what the real Python programs measured over real UDP sockets (<code>artifacts/demo_results.json</code>). The chart shows the larger offline experiment on all 10,000 test images.</p></div>
     <div class="card">
       <div class="val">
         <div class="tbl-wrap">
@@ -450,7 +456,10 @@ pre.cmd { font: 0.8rem/1.6 var(--f-mono); background: var(--surface); padding: 1
         <div><dt>Drop-tail queue</dt><dd>A buffer in front of a slow link. When it is full, newly arriving packets are discarded. The packets at the tail end lose.</dd></div>
         <div><dt>SAEC</dt><dd>The 13-byte control packet the receiver sends back 10 times a second, carrying its budget k and threshold τ.</dd></div>
         <div><dt>CRC32</dt><dd>A checksum of the pixel payload in the header. The receiver rejects a packet whose pixels were corrupted.</dd></div>
-        <div><dt>CIFAR-100</dt><dd>A standard dataset of 32×32 colour images in 100 classes. The CNN reaches 54.7% using all 16 tiles of these 300 images.</dd></div>
+        <div><dt>CIFAR-100</dt><dd>A standard dataset of 32×32 colour images in 100 classes. The CNN reaches <span class="acc16">–</span> using all 16 tiles of these 300 images.</dd></div>
+        <div><dt>Diversity (v3)</dt><dd>When choosing tiles one by one, a tile loses points if it sits next to, or looks like, a tile already chosen. This spreads the picks across the image.</dd></div>
+        <div><dt>Early exit (v3)</dt><dd>Instead of exactly k tiles per frame, stop as soon as the CNN is clearly sure, and spend the saved tiles on harder frames. The average stays k.</dd></div>
+        <div><dt>v2 / v3</dt><dd>v2: tags made by PCA and the original CNN. v3 (branch admission-v3): tags learned for this task, a ranking-trained scorer, a CNN retrained on the tiles it actually gets, and diversity.</dd></div>
       </dl>
     </details>
   </section>
@@ -471,6 +480,7 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
 (() => {
   "use strict";
   const E = window.SAEPEngine, D = window.SAEP_DATA, ds = new E.Dataset(D);
+  const fmtPct = x => (x * 100).toFixed(1) + "%";
   const P = ds.P, G = ds.grid, HOP = 0.010, PERIOD = 1 / 25, OFFERED = P * 25;
   const POL = [["fifo", "FIFO"], ["random", "Random"], ["tag", "int8 tag"], ["ctx", "Context MLP"]];
   const POL_ALL = [...POL, ["oracle", "Oracle"]];
@@ -487,19 +497,29 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
     tag: "int8 tag: each packet is scored on arrival from its tag alone, and kept if the score passes τ. Cheap enough for the kernel.",
     ctx: "Context MLP: the receiver buffers the whole frame, scores every tag relative to the others, and keeps the top k. This is the project's method.",
   };
-  const SCEN = [
-    ["Baseline: nothing is lost, everything is processed", "The receiver processes all 16 tiles of every frame. This is the best accuracy the CNN can reach (54.7%), and also the most CPU it can use."],
+  const SCEN_LIST = [
+    ["Baseline: nothing is lost, everything is processed", "The receiver processes all 16 tiles of every frame. This uses the most CPU. In the real UDP run it scored {clean link, no admission}."],
     ["Budget 4, keep whatever arrives first", "The receiver only has CPU for 4 of the 16 tiles. FIFO keeps the first 4 to arrive, which is always the top row of the image. Accuracy collapses."],
     ["Budget 4, keep 4 at random", "Same budget, but the 4 tiles are picked at random. Just spreading the picks across the image already helps a lot."],
     ["Budget 4, cheap per-packet scoring (XDP-style)", "Each tag is scored with a simple integer formula as the packet arrives. It cannot see the rest of the frame, so here it does no better than random. This finding is why the project added the context MLP."],
-    ["Budget 4, the project's method", "The receiver waits for the whole frame, scores all 16 tags together with a small neural network, and keeps the 4 best. It reaches 40.7%, against 25.7% for FIFO, with the same CPU."],
+    ["Budget 4, the project's method", "The receiver waits for the whole frame, scores all 16 tags together with a small neural network, and keeps the 4 best. In the real UDP run it reached {CPU budget k=4, tag + context MLP}, against {CPU budget k=4, FIFO} for FIFO, with the same CPU."],
     ["1 in 5 packets lost, FIFO", "The network now loses 20% of packets at random. FIFO still keeps whatever arrives first."],
     ["1 in 5 packets lost, the project's method", "Same losses, but the context MLP picks the best 4 of the survivors. Accuracy barely changes from the loss-free case."],
     ["Congested link, sender sends everything", "The link can carry only 30% of the traffic. The sender still sends all 16 tiles, so the queue overflows and the network, not the receiver, decides which tiles survive."],
     ["Congested link, sender listens to feedback", "Same narrow link, but the receiver tells the sender its budget (SAEC). The sender sends only its 4 best tiles, so almost nothing is dropped and 75% less traffic is sent."],
+    ["Budget 4 on average, early exit (v3)", "The receiver starts with 3 tiles and adds more only while the CNN is unsure, up to 8. Easy frames use few tiles, hard frames more, about 4 on average."],
+    ["1 in 5 lost, early exit (v3)", "Early exit with 20% random packet loss on the link."],
   ];
+  const SCEN_NAMES = E.SCENARIOS.map(sc => sc.name).concat(["CPU budget avg 4, context MLP + early exit", "20% loss + avg 4, context MLP + early exit"]);
+  const SCEN = SCEN_LIST.map(([t, d]) => [t, d.replace(/\{([^}]+)\}/g, (_, nm) => {
+    const m = D.measured.udp.find(r => r.name === nm);
+    return m ? fmtPct(m.accuracy) : "–";
+  })]);
+  const SCENARIOS = E.scenarios(ds);
+  const measuredOf = sc => D.measured.udp.find(r => r.name === sc.name);
+  const scenText = sc => SCEN[SCEN_NAMES.indexOf(sc.name)];
+  const V3 = !!ds.policy;
   const $ = id => document.getElementById(id);
-  const fmtPct = x => (x * 100).toFixed(1) + "%";
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
   const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
 
@@ -541,10 +561,10 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
     lastClosed: null, lastCmp: null, cnt: null, cmp: null, hist: [], stepTarget: null, ended: false,
     sel: null, follow: false, tab: "data", wall: performance.now(), cmpRng: E.mulberry32(99),
   };
-  function presetCfg(i) { const s = E.SCENARIOS[i]; return { k: s.k, policy: s.policy, loss: s.loss, rate: s.rate, feedback: s.feedback, ideal: false }; }
+  function presetCfg(i) { const s = SCENARIOS[i]; return { k: s.k, policy: s.policy, loss: s.loss, rate: s.rate, feedback: s.feedback, ideal: false, earlyExit: !!s.earlyExit }; }
   function engineCfg() {
     const c = S.cfg;
-    return { k: c.k, policy: c.policy, loss: c.loss, rate: c.rate, feedback: c.feedback, prop: HOP,
+    return { k: c.k, policy: c.policy, loss: c.loss, rate: c.rate, feedback: c.feedback, prop: HOP, earlyExit: c.earlyExit,
       linkTick: c.ideal ? 0 : E.WINDOWS_TIMER_TICK };
   }
   function resetCounters() {
@@ -592,7 +612,7 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
   }
   function finishRun() {
     S.ended = true; S.playing = false; syncPlay();
-    const m = S.preset != null ? D.measured.udp[S.preset] : null;
+    const m = S.preset != null ? measuredOf(SCENARIOS[S.preset]) : null;
     $("banner").hidden = false;
     $("banner").innerHTML = `<b>All 300 frames done.</b> Accuracy <b>${fmtPct(S.cnt.ok / S.cnt.frames)}</b>` +
       (m && S.cnt.frames === ds.n ? `. The real UDP run of this scenario measured <b>${fmtPct(m.accuracy)}</b>.` : ".") + " Press Restart to watch it again.";
@@ -612,12 +632,14 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
     if (lost || qd) {
       s += `On the link, ${lost ? `<span class="l">${lost} ${lost > 1 ? "were" : "was"} lost at random</span>` : ""}${lost && qd ? " and " : ""}${qd ? `<span class="q">${qd} ${qd > 1 ? "were" : "was"} thrown away because the queue was full</span>` : ""}, so ${r.arrived.length} arrived. `;
     } else s += `Nothing was lost on the link, so all ${r.arrived.length} arrived. `;
-    if (r.arrived.length <= c.k) s += `That is within the budget of ${c.k}, so the receiver kept all of them. `;
+    if (r.arrived.length <= c.k && !(c.earlyExit && c.policy === "ctx")) s += `That is within the budget of ${c.k}, so the receiver kept all of them. `;
     else s += {
       fifo: `The receiver can only afford ${c.k}, and FIFO simply kept the first ${c.k} to arrive (tiles ${list(r.admitted)}). `,
       random: `The receiver can only afford ${c.k} and kept packets whose random score passed the threshold (tiles ${list(r.admitted)}). `,
       tag: `The receiver can only afford ${c.k}. It scored each tag the moment it arrived and kept those above the threshold τ (tiles ${list(r.admitted)}). `,
-      ctx: `The receiver can only afford ${c.k}. It waited for the whole frame, scored all ${r.arrived.length} tags against each other with the context MLP, and kept the ${c.k} highest (tiles ${list(r.admitted)}). `,
+      ctx: c.earlyExit && ds.canExit(c.k)
+        ? `The receiver's average budget is ${c.k}. It ranked all ${r.arrived.length} tags with the context MLP${V3 ? ", spreading its picks across the image," : ""} and processed tiles in that order until the CNN was confident: it stopped after ${r.admitted.length} (tiles ${list(r.admitted)}). `
+        : `The receiver can only afford ${c.k}. It waited for the whole frame, scored all ${r.arrived.length} tags against each other with the context MLP${V3 ? ", avoided picking neighbouring or look-alike tiles," : ""} and kept the ${c.k} best (tiles ${list(r.admitted)}). `,
     }[c.policy];
     if (skipped > 0) s += `<span class="c">${skipped} arrived but ${skipped > 1 ? "were" : "was"} skipped.</span> `;
     s += r.admitted.length
@@ -1014,7 +1036,7 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
 
   /* ---------- controls ---------- */
   function buildControls() {
-    $("presets").innerHTML = E.SCENARIOS.map((s, i) => `<button class="chip" type="button" data-i="${i}" aria-pressed="false" title="${esc(s.name)}">${SCEN[i][0]}</button>`).join("");
+    $("presets").innerHTML = SCENARIOS.map((s, i) => `<button class="chip" type="button" data-i="${i}" aria-pressed="false" title="${esc(s.name)}">${scenText(s)[0]}</button>`).join("");
     $("presets").onclick = e => { const b = e.target.closest(".chip"); if (!b) return; S.preset = +b.dataset.i; S.cfg = presetCfg(S.preset); rebuild(0); play(true); };
     $("policySeg").innerHTML = POL.map(([k, nm]) => `<button type="button" data-k="${k}" aria-pressed="false">${nm}</button>`).join("");
     $("policySeg").onclick = e => { const b = e.target.closest("button"); if (!b) return; change({ policy: b.dataset.k }); };
@@ -1023,10 +1045,12 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
     $("rateIn").oninput = e => change({ rate: +e.target.value / 100 });
     $("fbIn").onchange = e => change({ feedback: e.target.checked });
     $("timerIn").onchange = e => change({ ideal: e.target.value === "ideal" });
+    $("exitIn").onchange = e => change({ earlyExit: e.target.checked });
+    $("exitKnob").hidden = !V3;
   }
   function change(patch) {
     Object.assign(S.cfg, patch);
-    const match = E.SCENARIOS.findIndex(s => s.k === S.cfg.k && s.policy === S.cfg.policy && Math.abs(s.loss - S.cfg.loss) < 1e-9 && Math.abs(s.rate - S.cfg.rate) < 1e-9 && s.feedback === S.cfg.feedback);
+    const match = SCENARIOS.findIndex(s => s.k === S.cfg.k && s.policy === S.cfg.policy && Math.abs(s.loss - S.cfg.loss) < 1e-9 && Math.abs(s.rate - S.cfg.rate) < 1e-9 && s.feedback === S.cfg.feedback && !!s.earlyExit === !!S.cfg.earlyExit);
     S.preset = match >= 0 && !S.cfg.ideal ? match : null;
     rebuild(S.lastClosed ? S.lastClosed.f + 1 : 0);
   }
@@ -1040,10 +1064,11 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
     $("rateIn").value = Math.round(c.rate * 100);
     $("rateOut").textContent = c.rate > 0 ? `${Math.round(c.rate * OFFERED)} pkt/s (${Math.round(c.rate * 100)}%)` : "off";
     $("fbIn").checked = c.feedback; $("timerIn").value = c.ideal ? "ideal" : "win";
-    if (S.preset != null) { $("scenT").textContent = SCEN[S.preset][0]; $("scenD").textContent = SCEN[S.preset][1]; }
+    $("exitIn").checked = !!c.earlyExit;
+    if (S.preset != null) { const sd = scenText(SCENARIOS[S.preset]); $("scenT").textContent = sd[0]; $("scenD").textContent = sd[1]; }
     else {
       $("scenT").textContent = "Custom settings";
-      $("scenD").textContent = `Budget k = ${c.k}, ${Math.round(c.loss * 100)}% random loss, ${c.rate > 0 ? `link limited to ${Math.round(c.rate * OFFERED)} packets/s` : "no capacity limit"}, ${c.feedback ? "sender obeys feedback" : "sender ignores feedback"}. ${POL_HELP[c.policy]}`;
+      $("scenD").textContent = `Budget k = ${c.k}, ${Math.round(c.loss * 100)}% random loss, ${c.rate > 0 ? `link limited to ${Math.round(c.rate * OFFERED)} packets/s` : "no capacity limit"}, ${c.feedback ? "sender obeys feedback" : "sender ignores feedback"}${c.earlyExit && c.policy === "ctx" ? ", early exit on" + (ds.canExit(c.k) ? "" : ` (not tuned for k = ${c.k}, so fixed k is used)`) : ""}. ${POL_HELP[c.policy]}`;
     }
   }
   function syncPlay() { $("playBtn").textContent = S.playing ? "Pause" : "Play"; }
@@ -1061,21 +1086,21 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
   /* ---------- validation: the nine run_demo.py scenarios through this engine ---------- */
   function buildValidation() {
     const tb = $("vt").querySelector("tbody");
-    tb.innerHTML = E.SCENARIOS.map((s, i) => {
-      const m = D.measured.udp[i];
-      return `<tr data-i="${i}"><td>${SCEN[i][0]}<br><span class="muted mono" style="font-size:0.72rem">${esc(s.name)}</span></td><td class="n">${fmtPct(m.accuracy)}</td><td class="n" id="vj${i}">…</td><td class="n" id="vl${i}">${m.link.forwarded} / –</td><td><button class="load" type="button" data-i="${i}">Watch</button></td></tr>`;
+    tb.innerHTML = SCENARIOS.map((s, i) => {
+      const m = measuredOf(s);
+      return `<tr data-i="${i}"><td>${scenText(s)[0]}<br><span class="muted mono" style="font-size:0.72rem">${esc(s.name)}</span></td><td class="n">${fmtPct(m.accuracy)}</td><td class="n" id="vj${i}">…</td><td class="n" id="vl${i}">${m.link.forwarded} / –</td><td><button class="load" type="button" data-i="${i}">Watch</button></td></tr>`;
     }).join("");
     tb.onclick = e => { const b = e.target.closest(".load"); if (!b) return; S.preset = +b.dataset.i; S.cfg = presetCfg(S.preset); rebuild(0); play(true); $("h-wire").scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "start" }); };
     let i = 0, exactOk = 0, exactN = 0, allOk = true;
     const stepRun = () => {
-      const sc = E.SCENARIOS[i], js = new E.Simulation(ds, sc).runAll(), m = D.measured.udp[i];
+      const sc = SCENARIOS[i], js = new E.Simulation(ds, sc).runAll(), m = measuredOf(sc);
       const exact = sc.loss === 0 && sc.rate === 0 && sc.policy !== "random";
       const diff = Math.abs(js.accuracy - m.accuracy), ok = exact ? diff < 1e-9 : diff <= 0.05;
       if (exact) { exactN++; if (ok) exactOk++; }
       if (!ok) allOk = false;
       $("vj" + i).innerHTML = `${fmtPct(js.accuracy)} <span class="pill ${ok ? "good" : "bad"}" title="${exact ? "No randomness: must match exactly" : "Involves chance: expected within a few points"}">${exact && ok ? "exact" : "Δ " + (diff * 100).toFixed(1)}</span>`;
       $("vl" + i).textContent = `${m.link.forwarded} / ${js.received}`;
-      if (++i < E.SCENARIOS.length) setTimeout(stepRun, 0);
+      if (++i < SCENARIOS.length) setTimeout(stepRun, 0);
       else {
         const pill = $("parityPill");
         pill.className = "pill " + (allOk ? "good" : "bad");
@@ -1090,7 +1115,9 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
     const svg = $("chart"); if (!svg || !C.ink || !S.cfg) return;
     const ob = D.measured.offline_budget, W = 560, H = 330, m = { l: 46, r: 118, t: 30, b: 42 };
     const xs = k => m.l + (k - 1) / 15 * (W - m.l - m.r), ys = v => H - m.b - v / 0.8 * (H - m.t - m.b);
-    const lines = [["fifo", "FIFO", "fifo"], ["random", "Random", "random"], ["tag", "int8 tag", "tag"], ["tag+ctx_mlp", "Ctx MLP", "ctx"], ["oracle", "Oracle", "oracle"]];
+    const lines = V3 && ob.v3
+      ? [["fifo", "FIFO", "fifo"], ["random", "Random", "random"], ["tag+ctx_mlp", "v2 method", "tag"], ["v3", "v3 method", "ctx"], ["oracle", "Oracle", "oracle"]]
+      : [["fifo", "FIFO", "fifo"], ["random", "Random", "random"], ["tag", "int8 tag", "tag"], ["tag+ctx_mlp", "Ctx MLP", "ctx"], ["oracle", "Oracle", "oracle"]];
     let g = "";
     g += `<text x="${m.l}" y="16" fill="${C.ink}" font-family="IBM Plex Sans Condensed, sans-serif" font-weight="600" font-size="14">Accuracy vs budget k, ${D.measured.offline_n.toLocaleString()} test images</text>`;
     for (let v = 0; v <= 0.8001; v += 0.2) {
@@ -1109,6 +1136,7 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
       const hero = tok === "ctx";
       g += `<polyline points="${pts}" fill="none" stroke="${C[tok]}" stroke-width="${hero ? 2.6 : 1.5}" ${tok === "oracle" ? 'stroke-dasharray="5 4"' : ""}/>`;
       const a = v[S.cfg.k - 1];
+      if (a == null) continue;
       g += `<circle cx="${kx}" cy="${ys(a)}" r="${hero ? 4 : 3}" fill="${C[tok]}"/>`;
       ends.push({ y0: ys(a), nm: `${nm} ${(a * 100).toFixed(1)}`, col: C[tok] });
     }
@@ -1119,6 +1147,10 @@ node viz/parity_test.js                   # browser engine vs Python, 16 checks<
   }
 
   /* ---------- boot ---------- */
+  $("modelPill").textContent = V3 ? "model v3 · branch admission-v3" : "model v2";
+  $("modelPill").className = "pill" + (V3 ? " good" : "");
+  $("artDir").textContent = V3 ? "artifacts/v3/" : "artifacts/";
+  document.querySelectorAll(".acc16").forEach(el => (el.textContent = fmtPct(D.ref.acc_all16)));
   buildControls(); buildCompare();
   S.cfg = presetCfg(S.preset);
   rebuild(0);

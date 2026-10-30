@@ -63,7 +63,74 @@
       this.H = d.ctx.hidden;
       this.labels = d.labels; this.names = d.class_names;
       this.cpu = d.cpu_ms;
+      this.policy = d.policy || null;  // v3: diversity weights and early-exit thresholds
+      this.adj = Array.from({ length: this.P }, (_, i) => {
+        const r = Math.floor(i / this.grid), c = i % this.grid, out = [];
+        if (r > 0) out.push(i - this.grid); if (r < this.grid - 1) out.push(i + this.grid);
+        if (c > 0) out.push(i - 1); if (c < this.grid - 1) out.push(i + 1);
+        return out;
+      });
     }
+
+    /* saep.models.select_diverse for one frame: greedy pick maximising
+     * score - lam_adj * (#picked 4-neighbours) - lam_sim * max(cos sim to a picked tag, 0) */
+    selectDiverse(f, idx, s, k) {
+      const P = this.P, D = this.D, { lam_adj, lam_sim } = this.policy;
+      const score = new Float64Array(P).fill(-Infinity), unit = [];
+      idx.forEach((i, j) => (score[i] = s[j]));
+      for (let i = 0; i < P; i++) {
+        const t = this.tag(f, i);
+        let n = 0;
+        for (let j = 0; j < D; j++) n += t[j] * t[j];
+        n = Math.max(Math.sqrt(n), 1e-6);
+        unit.push(Float64Array.from(t, v => v / n));
+      }
+      const near = new Float64Array(P), maxsim = new Float64Array(P).fill(-1), picked = new Uint8Array(P), order = [];
+      for (let j = 0; j < k; j++) {
+        let best = -1, bv = -Infinity;
+        for (let i = 0; i < P; i++) {
+          if (picked[i] || score[i] === -Infinity) continue;
+          const v = score[i] - lam_adj * near[i] - lam_sim * Math.max(maxsim[i], 0);
+          if (v > bv) { bv = v; best = i; }
+        }
+        if (best < 0) break;
+        order.push(best); picked[best] = 1;
+        for (const nb of this.adj[best]) near[nb] += 1;
+        for (let i = 0; i < P; i++) {
+          let dot = 0;
+          for (let j = 0; j < D; j++) dot += unit[best][j] * unit[i][j];
+          if (dot > maxsim[i]) maxsim[i] = dot;
+        }
+      }
+      return order;
+    }
+
+    /* saep.models.exit_confidence: softmax margin between the top two classes */
+    exitMargin(sumLogits, n) {
+      const C = this.C;
+      let m = -Infinity;
+      for (let c = 0; c < C; c++) m = Math.max(m, sumLogits[c] / n);
+      let sum = 0, a = 0, b = 0;
+      for (let c = 0; c < C; c++) {
+        const e = Math.exp(sumLogits[c] / n - m);
+        sum += e;
+        if (e > a) { b = a; a = e; } else if (e > b) b = e;
+      }
+      return (a - b) / sum;
+    }
+
+    /* Early exit over a ranked tile list: k-1 tiles first, then one at a time until confident */
+    earlyExit(f, ranked, budget) {
+      const theta = this.policy.exit[String(budget)];
+      const kmin = Math.max(1, budget - 1), kmax = Math.min(this.P, this.policy.kmax_mult * budget);
+      const list = ranked.slice(0, kmax), C = this.C, acc = new Float64Array(C);
+      const add = i => { const o = (f * this.P + i) * C; for (let c = 0; c < C; c++) acc[c] += this.logits[o + c]; };
+      let used = Math.min(kmin, list.length);
+      for (let j = 0; j < used; j++) add(list[j]);
+      while (used < list.length && this.exitMargin(acc, used) < theta) add(list[used++]);
+      return list.slice(0, used);
+    }
+    canExit(budget) { return !!(this.policy && this.policy.exit[String(budget)] != null); }
     tag(f, i) { const o = (f * this.P + i) * this.D; return this.tags.subarray(o, o + this.D); }
 
     /* HWC uint8 bytes of tile i, exactly the 192-byte packet payload */
@@ -203,7 +270,7 @@
     constructor(ds, cfg) {
       this.ds = ds;
       this.cfg = Object.assign({ k: 4, policy: "ctx", loss: 0, rate: 0, feedback: false,
-        fps: 25, queue: 8, seed: 1, prop: 0, saecHz: 10, frameTimeout: 0.15,
+        fps: 25, queue: 8, seed: 1, prop: 0, saecHz: 10, frameTimeout: 0.15, earlyExit: false,
         linkTick: WINDOWS_TIMER_TICK, jitter: 0.0015 }, cfg);
       this.jitterRng = mulberry32(this.cfg.seed + 13);
       this.period = 1 / this.cfg.fps;
@@ -246,7 +313,8 @@
         let order = Array.from({ length: P }, (_, i) => i), senderScores = null;
         if (cfg.feedback) {  // sender sees the whole frame and sends only its top `budget`
           senderScores = ds.ctxScores(f, order);
-          order = order.slice().sort((a, b) => senderScores[b] - senderScores[a] || a - b).slice(0, budget);
+          order = (ds.policy ? ds.selectDiverse(f, order, senderScores, P)
+            : order.slice().sort((a, b) => senderScores[b] - senderScores[a] || a - b)).slice(0, budget);
         }
         const gap = this.period / order.length, pkts = [];
         for (const idx of order) {
@@ -295,8 +363,13 @@
       if (cfg.policy === "ctx") {  // buffer the frame, rescore in user space, keep top-k
         const idx = arrived.map(p => p.idx), s = ds.ctxScores(f, idx);
         idx.forEach((i, j) => (rec.scores[i] = s[j]));
-        const keep = idx.map((_, j) => j).sort((a, b) => s[b] - s[a] || a - b).slice(0, k);
-        admitted = keep.map(j => idx[j]);
+        if (ds.policy) {  // v3: diversity-aware order, optionally early exit (receiver.py --diverse/--early-exit)
+          const ranked = ds.selectDiverse(f, idx, s, P);
+          admitted = cfg.earlyExit && ds.canExit(k) ? ds.earlyExit(f, ranked, k) : ranked.slice(0, k);
+        } else {
+          const keep = idx.map((_, j) => j).sort((a, b) => s[b] - s[a] || a - b).slice(0, k);
+          admitted = keep.map(j => idx[j]);
+        }
         for (const p of arrived) p.decision = admitted.includes(p.idx) ? "admit" : "cdrop";
       } else {  // per-packet early path: peek tag, score, threshold + quota
         for (const p of arrived) {
@@ -350,7 +423,7 @@
       fifo: arrivedIdx.slice(0, k),
       random: pickBy(arrivedIdx.map(() => rng())),
       tag: pickBy(arrivedIdx.map(i => ds.tagScore(f, i))),
-      ctx: pickBy(ctx),
+      ctx: ds.policy ? ds.selectDiverse(f, arrivedIdx, ctx, k) : pickBy(ctx),
       oracle: pickBy(arrivedIdx.map(i => ds.utility(f, i))),
     };
     const out = {};
@@ -358,6 +431,13 @@
     return out;
   }
 
-  root.SAEPEngine = { Dataset, Simulation, ThresholdController, SCENARIOS, comparePolicies, crc32,
+  /* run_demo.py --v3 adds two early-exit rows */
+  const EXIT_SCENARIOS = [
+    { name: "CPU budget avg 4, context MLP + early exit", k: 4, policy: "ctx", loss: 0.0, rate: 0, feedback: false, earlyExit: true },
+    { name: "20% loss + avg 4, context MLP + early exit", k: 4, policy: "ctx", loss: 0.2, rate: 0, feedback: false, earlyExit: true },
+  ];
+  const scenarios = ds => ds.policy ? [...SCENARIOS, ...EXIT_SCENARIOS] : SCENARIOS;
+
+  root.SAEPEngine = { Dataset, Simulation, ThresholdController, SCENARIOS, scenarios, comparePolicies, crc32,
     encodeControl, mulberry32, HEADER, SAEC_LEN, WINDOWS_TIMER_TICK };
 })(typeof globalThis !== "undefined" ? globalThis : window);

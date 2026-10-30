@@ -141,6 +141,9 @@ All 16 tiles: 50.0 (v2 receiver), 49.4 (v3 receiver). The int8 XDP-stage scorer 
 5. Leakage control: a linear probe on the mean of the 16 learned tags reaches 74.4% (PCA tags: 71.3%).
    The tags are still used only for admission, but they now say a little more about the class.
 
+Browser simulator with the v3 models: `python scripts/export_viz.py --artifacts artifacts/v3`, then open
+`viz/SAEP_Simulator_v3.html` (`node viz/parity_test.js data_v3.js` checks it against Python and the v3 UDP run).
+
 Reproduce: `python scripts/train_v3.py` (about 2 min on the laptop GPU, log in `artifacts/v3/train_log.txt`),
 then `python scripts/simulate_v3.py` and `python scripts/run_demo.py --frames 300 --v3`.
 

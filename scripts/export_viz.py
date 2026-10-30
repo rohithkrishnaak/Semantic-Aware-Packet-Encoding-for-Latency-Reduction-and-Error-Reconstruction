@@ -21,7 +21,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from saep.data import ARTIFACTS, CIFAR_DIR, ROOT, load_cifar  # noqa: E402
-from saep.models import load_admission, load_receiver  # noqa: E402
+from saep.models import (adaptive_exit, exit_bounds, load_admission, load_policy_params,  # noqa: E402
+                         load_receiver, order_to_mask, select_diverse)
 from saep.protocol import Packet, encode_packet  # noqa: E402
 from scripts.simulate import accuracy, select_topk  # noqa: E402
 from scripts.train import tile_logits, to_tiles  # noqa: E402
@@ -33,30 +34,35 @@ def b64(a: np.ndarray) -> str:
     return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
 
 
-def build_standalone() -> None:
-    """viz/simulator.html + engine.js + data.js -> one offline file (fonts fall back if offline)."""
+def build_standalone(data_name: str = "data.js", out_name: str = "SAEP_Simulator.html") -> None:
+    """viz/simulator.html + engine.js + data file -> one offline file (fonts fall back if offline)."""
     page = (VIZ / "simulator.html").read_text(encoding="utf-8")
-    for name in ("data.js", "engine.js"):
-        page = page.replace(f'<script src="{name}"></script>',
+    for tag, name in (("data.js", data_name), ("engine.js", "engine.js")):
+        page = page.replace(f'<script src="{tag}"></script>',
                             "<script>\n" + (VIZ / name).read_text(encoding="utf-8") + "\n</script>")
     head = ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
             '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
             "<style>body{margin:0}[hidden]{display:none!important}</style>\n</head>\n<body>\n")
-    (VIZ / "SAEP_Simulator.html").write_text(head + page + "\n</body>\n</html>\n", encoding="utf-8")
-    print(f"wrote {VIZ / 'SAEP_Simulator.html'}")
+    (VIZ / out_name).write_text(head + page + "\n</body>\n</html>\n", encoding="utf-8")
+    print(f"wrote {VIZ / out_name}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames", type=int, default=300)
     ap.add_argument("--offset", type=int, default=0)
-    ap.add_argument("--standalone-only", action="store_true", help="only rebuild viz/SAEP_Simulator.html")
+    ap.add_argument("--standalone-only", action="store_true", help="only rebuild the offline HTML file")
+    ap.add_argument("--artifacts", type=Path, default=ARTIFACTS,
+                    help="model dir; artifacts/v3 writes viz/data_v3.js and viz/SAEP_Simulator_v3.html")
     args = ap.parse_args()
+    v3 = args.artifacts.resolve() != ARTIFACTS.resolve()
+    data_name, out_name = ("data_v3.js", "SAEP_Simulator_v3.html") if v3 else ("data.js", "SAEP_Simulator.html")
     if args.standalone_only:
-        return build_standalone()
+        return build_standalone(data_name, out_name)
 
-    scheme, scorers, _, grid = load_admission(ARTIFACTS / "admission.npz")
-    model = load_receiver(ARTIFACTS / "receiver.pt", grid)
+    scheme, scorers, _, grid = load_admission(args.artifacts / "admission.npz")
+    model = load_receiver(args.artifacts / "receiver.pt", grid)
+    policy = load_policy_params(args.artifacts / "admission.npz")
     feats = np.load(ARTIFACTS / "features_test.npz")
     sl = slice(args.offset, args.offset + args.frames)
     images, labels = load_cifar(CIFAR_DIR / "test")
@@ -82,6 +88,13 @@ def main() -> None:
     ref["ctx_scores_partial_f0"] = scorers["ctx"].score(tags[:1], drop[:1])[0].tolist()
     ref["ctx_scores_f0"] = ctx_full[0].tolist()
     ref["tag_scores_f0"] = scorers["tag"].score(tags[0], np.arange(p)).tolist()
+    if policy:  # v3 selection rules, for the parity test
+        full = select_diverse(ctx_full, tags, all_avail, p, grid, policy["lam_adj"], policy["lam_sim"])
+        ref["div_order_f0"] = full[0].tolist()
+        ref["div_acc_k4"] = accuracy(z, labels, order_to_mask(full[:, :4], p))
+        used = adaptive_exit(z, full, policy["exit"][4], *exit_bounds(4, policy["exit_kmax_mult"], p))
+        ref["exit_used_k4"] = used.tolist()
+        ref["exit_acc_k4"] = accuracy(z, labels, order_to_mask(np.where(np.arange(p)[None] < used[:, None], full, -1), p))
     ref["packet_f3_i5"] = encode_packet(Packet(3, 5, p, scheme.scheme_id, tags[3, 5],
                                                tiles[3, 5].tobytes())).hex()
 
@@ -92,8 +105,17 @@ def main() -> None:
                 measured_budget.setdefault(r["policy"], []).append(float(r["value"]))
             elif r["scenario"] == "cpu_ms":
                 cpu.append([int(r["k"]), float(r["value"])])
+    v3_csv = args.artifacts / "sim_results_v3.csv"
+    if v3 and v3_csv.exists():  # v3 curve (diversity, k = 1..8) on the same 10k test images
+        with v3_csv.open() as f:
+            measured_budget["v3"] = [float(r["value"]) for r in csv.DictReader(f)
+                                     if r["scenario"] == "budget" and r["variant"] == "+diversity"]
 
     data = {
+        "model": "v3" if v3 else "v2",
+        "policy": {"lam_adj": policy["lam_adj"], "lam_sim": policy["lam_sim"],
+                   "exit": {str(b): t for b, t in policy["exit"].items()},
+                   "kmax_mult": policy["exit_kmax_mult"]} if policy else None,
         "n": n, "grid": grid, "tile": 32 // grid, "tag_dim": tags.shape[-1], "classes": len(names),
         "scheme_id": scheme.scheme_id, "offset": args.offset,
         "class_names": names, "labels": labels.tolist(),
@@ -105,16 +127,16 @@ def main() -> None:
                 "w2": b64(scorers["ctx"].w2.astype(np.float32)), "b2": float(scorers["ctx"].b2),
                 "in_scale": float(scorers["ctx"].in_scale), "hidden": int(scorers["ctx"].b1.shape[0])},
         "cpu_ms": cpu,
-        "measured": {"udp": json.loads((ARTIFACTS / "demo_results.json").read_text()),
+        "measured": {"udp": json.loads((args.artifacts / "demo_results.json").read_text()),
                      "offline_budget": measured_budget, "offline_n": int(len(feats["labels"]))},
         "ref": ref,
     }
     VIZ.mkdir(exist_ok=True)
-    (VIZ / "data.js").write_text("window.SAEP_DATA = " + json.dumps(data, separators=(",", ":")) + ";\n")
-    print(f"wrote {VIZ / 'data.js'}: {n} frames, all-tiles acc {ref['acc_all16']:.3f}, "
+    (VIZ / data_name).write_text("window.SAEP_DATA = " + json.dumps(data, separators=(",", ":")) + ";\n")
+    print(f"wrote {VIZ / data_name}: {n} frames, all-tiles acc {ref['acc_all16']:.3f}, "
           f"k=4 fifo {ref['curves']['fifo'][3]:.3f} tag {ref['curves']['tag'][3]:.3f} "
           f"ctx {ref['curves']['ctx'][3]:.3f}")
-    build_standalone()
+    build_standalone(data_name, out_name)
 
 
 if __name__ == "__main__":
