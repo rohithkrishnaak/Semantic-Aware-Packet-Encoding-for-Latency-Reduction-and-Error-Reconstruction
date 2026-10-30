@@ -88,6 +88,62 @@ tags are used *only* for admission, and the receiver classifies from pixels.
                          the network already dropped.
 ```
 
+## v3: better admission under the same constraints (branch `admission-v3`)
+
+Same wire format (32 B int8 tag per packet), same receiver budget k, the receiver still classifies
+from pixels only, and nothing uses the label at run time. Everything was tuned on the 5k validation
+split; the test numbers below come from one run of `scripts/simulate_v3.py`. The v2 artifacts are
+untouched: v3 writes to `artifacts/v3/`, and `artifacts/v2_backup/` holds a copy of v2.
+
+| change | what it does |
+|---|---|
+| learned tag projection | 384→32 projection trained for admission (straight-through int8 rounding), initialised from PCA. Replaces PCA. |
+| ranking loss | the context MLP is trained with a listwise loss: softmax over a frame's arrived tiles vs. softmax of their utility. Only the order within a frame matters. |
+| policy-aware receiver | the CNN is fine-tuned on the tiles the scorer actually admits (top-k after random loss, k ~ 1..8), mixed 50/50 with random masks. |
+| diversity | greedy selection penalises tiles next to, or with tags similar to, tiles already picked (λ_adj = 0.2, λ_sim = 1.0). |
+| early exit | per-frame k with the same average: process k−1 tiles, add more until the softmax margin passes θ, at most 2k. |
+
+**Offline, test set, budget k (accuracy; each column adds one change):**
+
+| k | v2 | + learned tags + ranking | + receiver fine-tune | + diversity | + early exit (avg tiles) |
+|---|---|---|---|---|---|
+| 1 | 27.7 | 32.8 | 36.8 | 36.8 | 36.8 (1.00) |
+| 2 | 34.5 | 40.7 | 44.9 | 45.9 | 45.5 (1.97) |
+| 4 | 41.3 | 46.6 | 50.0 | **52.1** | 52.1 (3.98) |
+| 6 | 45.2 | 49.8 | 52.3 | 53.2 | 53.5 (6.06) |
+| 8 | 46.8 | 51.0 | 52.9 | 53.7 | 53.5 (8.00) |
+
+With loss before admission (k = 4): p = 0.3 goes from 40.7 (v2) to 49.5, and p = 0.5 from 39.3 to 45.2.
+All 16 tiles: 50.0 (v2 receiver), 49.4 (v3 receiver). The int8 XDP-stage scorer alone: 37.3 → 38.4.
+
+**End-to-end UDP, 300 frames** (`python scripts/run_demo.py --frames 300 --v3`, results in `artifacts/v3/demo_results.json`):
+
+| configuration | v2 | v3 |
+|---|---|---|
+| k=4, context MLP | 40.7 | **54.0** (diversity on) |
+| 20% loss + k=4, context MLP | 40.7 | **54.3** |
+| 30% bottleneck, feedback sender (k=4) | 41.0 | **53.7** |
+| avg 4, + early exit | | 55.3 (3.7 tiles/frame) |
+
+**What to take away**
+
+1. At k = 4 the receiver now beats processing all 16 tiles (52.1 vs 50.0) with 25% of the packets.
+   Averaging logits over low-value tiles dilutes the evidence; good selection avoids that.
+2. The two biggest gains come from the learned tags + ranking loss (+5.3) and from fine-tuning the
+   receiver on the tiles it really gets (+3.4). Diversity adds about +2 at k = 3–4.
+3. Early exit is roughly neutral offline (0 to +0.4 points, within noise for 10k images). Over UDP it
+   uses fewer tiles but more CPU time (2.65 vs 2.19 ms/frame), because each extra PyTorch call costs
+   about 0.5 ms of fixed overhead. It is off by default (`receiver.py --early-exit`). It may pay off with a
+   low-overhead runtime such as ONNX on the Pi. The first version (max-probability confidence,
+   starting from 1 tile) was *worse* than fixed k (48.2 vs 51.5 on val), because the CNN is
+   overconfident on one or two tiles.
+4. Diversity selection runs in numpy and adds about 0.4 ms per frame in Python. In C it would be microseconds.
+5. Leakage control: a linear probe on the mean of the 16 learned tags reaches 74.4% (PCA tags: 71.3%).
+   The tags are still used only for admission, but they now say a little more about the class.
+
+Reproduce: `python scripts/train_v3.py` (about 2 min on the laptop GPU, log in `artifacts/v3/train_log.txt`),
+then `python scripts/simulate_v3.py` and `python scripts/run_demo.py --frames 300 --v3`.
+
 ## Live simulator (browser)
 
 Open `viz/SAEP_Simulator.html` (after `python scripts/export_viz.py`). It is a single offline file; no
@@ -118,6 +174,8 @@ scripts/extract_features.py  Phase 1: DINOv2 ViT-S/14 once on GPU → per-tile p
 scripts/train.py        Phase 2: tag projection, receiver, utilities, scorers, control probes
 scripts/simulate.py     Phase 3: offline policy comparison (+ CSV and plot in artifacts/)
 scripts/sender.py / receiver.py / link_emulator.py / run_demo.py   UDP end-to-end
+scripts/train_v3.py     v3: learned tags, ranking loss, policy-aware receiver, diversity, early exit
+scripts/simulate_v3.py  v3 ablation on the test set
 scripts/export_viz.py   real artifacts -> viz/data.js (+ offline viz/SAEP_Simulator.html)
 viz/engine.js           JS port of sender, link emulator and receiver (no DOM)
 viz/simulator.html      live browser simulator (source page)

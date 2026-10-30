@@ -17,7 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from saep.data import ARTIFACTS, CIFAR_DIR, load_cifar  # noqa: E402
-from saep.models import load_admission  # noqa: E402
+from saep.models import load_admission, load_policy_params, select_diverse  # noqa: E402
 from saep.protocol import Packet, decode_control, encode_packet  # noqa: E402
 from scripts.train import to_tiles  # noqa: E402
 
@@ -31,9 +31,11 @@ def main() -> None:
     ap.add_argument("--offset", type=int, default=0, help="first test image index")
     ap.add_argument("--feedback", action="store_true", help="reorder/filter using receiver feedback")
     ap.add_argument("--sender-filter", action="store_true", help="with feedback: send only top `budget`")
+    ap.add_argument("--artifacts", type=Path, default=ARTIFACTS, help="admission model dir (artifacts/v3 for v3)")
     args = ap.parse_args()
 
-    scheme, scorers, _, grid = load_admission(ARTIFACTS / "admission.npz")
+    scheme, scorers, _, grid = load_admission(args.artifacts / "admission.npz")
+    policy = load_policy_params(args.artifacts / "admission.npz")
     feats = np.load(ARTIFACTS / "features_test.npz")
     sl = slice(args.offset, args.offset + args.frames)
     images, labels = load_cifar(CIFAR_DIR / "test")
@@ -41,6 +43,11 @@ def main() -> None:
     tags = scheme.tags(feats["tile_tok"][sl])
     p = grid * grid
     scores = scorers["ctx"].score(tags)  # sender sees whole frame: use the context scorer
+    if "lam_adj" in policy:  # v3: send in diversity-aware greedy order
+        ranked = select_diverse(scores, tags, np.ones(scores.shape, bool), grid * grid, grid,
+                                policy["lam_adj"], policy["lam_sim"])
+    else:
+        ranked = np.argsort(-scores, axis=1, kind="stable")
     n = len(tiles)
 
     (ARTIFACTS / "sidecar_labels.csv").write_text(
@@ -67,7 +74,7 @@ def main() -> None:
                 continue
         order = np.arange(p)
         if args.feedback:
-            order = np.argsort(-scores[f], kind="stable")
+            order = ranked[f]
             if args.sender_filter:
                 order = order[:budget]
         gap = period / len(order)  # spread this frame's packets over the frame period

@@ -22,7 +22,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from saep.data import ARTIFACTS  # noqa: E402
-from saep.models import load_admission, load_receiver  # noqa: E402
+from saep.models import (exit_bounds, exit_confidence, load_admission, load_policy_params,  # noqa: E402
+                         load_receiver, select_diverse)
 from saep.protocol import Control, decode_packet, encode_control, peek_tag  # noqa: E402
 
 
@@ -57,11 +58,21 @@ def main() -> None:
     ap.add_argument("--frame-timeout", type=float, default=0.15, help="s after first packet")
     ap.add_argument("--idle-exit", type=float, default=3.0)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--artifacts", type=Path, default=ARTIFACTS, help="model dir (artifacts/v3 for v3)")
+    ap.add_argument("--diverse", action="store_true", help="ctx: greedy pick with diversity penalty (v3)")
+    ap.add_argument("--early-exit", action="store_true",
+                    help="ctx: stop adding tiles once confident; --budget becomes the average (v3)")
     args = ap.parse_args()
 
     torch.set_num_threads(1)
-    scheme, scorers, _, grid = load_admission(ARTIFACTS / "admission.npz")
-    model = load_receiver(ARTIFACTS / "receiver.pt", grid)
+    scheme, scorers, _, grid = load_admission(args.artifacts / "admission.npz")
+    model = load_receiver(args.artifacts / "receiver.pt", grid)
+    policy = load_policy_params(args.artifacts / "admission.npz")
+    if (args.diverse or args.early_exit) and "lam_adj" not in policy:
+        ap.error("--diverse/--early-exit need v3 artifacts (scripts/train_v3.py)")
+    theta = policy.get("exit", {}).get(args.budget) if args.early_exit else None
+    if args.early_exit and theta is None:
+        ap.error(f"no early-exit threshold for budget {args.budget}; tuned budgets: {sorted(policy['exit'])}")
     p, t = grid * grid, 32 // grid
     sidecar = {}
     rng = np.random.default_rng(0)
@@ -93,11 +104,40 @@ def main() -> None:
         t0 = time.perf_counter()
         idx = np.array(list(fr["tiles"]))
         if args.policy == "ctx":  # user-space rescoring stage over the buffered frame
-            keep = np.argsort(-scorers["ctx"].score(np.stack([fr["tags"][i] for i in idx])),
-                              kind="stable")[:args.budget]
+            s = scorers["ctx"].score(np.stack([fr["tags"][i] for i in idx]))
+            if args.diverse or args.early_exit:  # v3: diversity-aware order over tile positions
+                full_s, full_t = np.full((1, p), -np.inf), np.zeros((1, p, len(fr["tags"][idx[0]])), np.int8)
+                full_s[0, idx] = s
+                full_t[0, idx] = np.stack([fr["tags"][i] for i in idx])
+                order = select_diverse(full_s, full_t, np.isfinite(full_s), p, grid,
+                                       policy["lam_adj"], policy["lam_sim"])[0]
+                ranked = order[order >= 0]
+            else:
+                ranked = idx[np.argsort(-s, kind="stable")]
+            if args.early_exit:  # the first kmin tiles in one batch, then one at a time until confident
+                kmin, kmax = exit_bounds(args.budget, policy["exit_kmax_mult"], p)
+                ranked = ranked[:kmax]
+
+                def encode(sel):
+                    x = torch.from_numpy(np.stack([np.frombuffer(fr["tiles"][i], np.uint8).reshape(t, t, 3)
+                                                   for i in sel]))
+                    return model.tile_logits(x, torch.from_numpy(np.asarray(sel))).sum(0)
+
+                with torch.inference_mode():
+                    used = min(kmin, len(ranked))
+                    acc_logits = encode(ranked[:used])
+                    while used < len(ranked) and exit_confidence((acc_logits / used).numpy()) < theta:
+                        acc_logits = acc_logits + encode(ranked[used:used + 1])
+                        used += 1
+                st["controlled_drop"] += len(idx) - used
+                st["admitted"] += used
+                proc_ms.append((time.perf_counter() - t0) * 1e3)
+                correct += int(int(acc_logits.argmax()) == sidecar.get(fid, -1))
+                return
+            keep = ranked[:args.budget]
             st["controlled_drop"] += len(idx) - len(keep)
             st["admitted"] += len(keep)
-            idx = idx[keep]
+            idx = keep
         x = torch.from_numpy(np.stack([np.frombuffer(fr["tiles"][i], np.uint8).reshape(t, t, 3) for i in idx]))
         with torch.inference_mode():
             logits = model.tile_logits(x, torch.from_numpy(idx)).mean(0)

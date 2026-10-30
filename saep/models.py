@@ -152,6 +152,104 @@ class ContextScorer:
                    l2.weight.detach().cpu().numpy()[0], float(l2.bias.item()))
 
 
+def grid_adjacency(grid: int) -> np.ndarray:
+    """(P,P) 0/1 matrix of 4-neighbours on the tile grid."""
+    p = grid * grid
+    a = np.zeros((p, p), np.float32)
+    for i in range(p):
+        r, c = divmod(i, grid)
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            if 0 <= r + dr < grid and 0 <= c + dc < grid:
+                a[i, (r + dr) * grid + c + dc] = 1
+    return a
+
+
+def select_diverse(score: np.ndarray, tags: np.ndarray, available: np.ndarray, k: int, grid: int,
+                   lam_adj: float, lam_sim: float) -> np.ndarray:
+    """Greedy top-k with a diversity penalty (maximal marginal relevance).
+
+    Each next pick maximises score - lam_adj * (#already-picked 4-neighbours)
+    - lam_sim * (max cosine similarity of its tag to an already-picked tag).
+    Returns (N, k) tile indices in pick order, -1 where fewer than k tiles were available.
+    """
+    n, p = score.shape
+    adj = grid_adjacency(grid)
+    t = tags.astype(np.float32)
+    t /= np.maximum(np.linalg.norm(t, axis=-1, keepdims=True), 1e-6)
+    sim = t @ t.transpose(0, 2, 1)  # (N,P,P)
+    picked = np.zeros((n, p), bool)
+    near = np.zeros((n, p), np.float32)
+    maxsim = np.full((n, p), -1.0, np.float32)
+    order = np.full((n, k), -1, np.int64)
+    rows = np.arange(n)
+    for j in range(k):
+        pen = score - lam_adj * near - lam_sim * np.maximum(maxsim, 0)
+        pen = np.where(available & ~picked, pen, -np.inf)
+        best = pen.argmax(1)
+        ok = np.isfinite(pen[rows, best])
+        order[ok, j] = best[ok]
+        picked[rows[ok], best[ok]] = True
+        near[ok] += adj[best[ok]]
+        maxsim[ok] = np.maximum(maxsim[ok], sim[rows[ok], best[ok]])
+    return order
+
+
+def order_to_mask(order: np.ndarray, p: int) -> np.ndarray:
+    mask = np.zeros((len(order), p), bool)
+    rows, cols = np.nonzero(order >= 0)
+    mask[rows, order[rows, cols]] = True
+    return mask
+
+
+def exit_confidence(mean_logits: np.ndarray) -> np.ndarray:
+    """Softmax margin between the top two classes; the early-exit stopping signal."""
+    m = mean_logits - mean_logits.max(-1, keepdims=True)
+    pr = np.exp(m) / np.exp(m).sum(-1, keepdims=True)
+    top2 = np.partition(pr, -2, axis=-1)[..., -2:]
+    return top2[..., 1] - top2[..., 0]
+
+
+def exit_bounds(budget: int, kmax_mult: int, p: int) -> tuple[int, int]:
+    """Early exit always processes budget-1 tiles and may extend to kmax_mult * budget."""
+    return max(1, budget - 1), min(p, kmax_mult * budget)
+
+
+def adaptive_exit(z: np.ndarray, order: np.ndarray, theta: float, kmin: int, kmax: int) -> np.ndarray:
+    """Early exit: process tiles in `order`, stop once the softmax margin (top1 - top2) >= theta.
+
+    The receiver's image logits are the running mean of per-tile logits, so each extra tile
+    costs one tile encode and no recomputation. Returns the number of tiles used per frame
+    (0 if nothing arrived). z: (N,P,C) per-tile logits, order: (N,>=kmax) indices, -1 = none.
+    """
+    n = len(z)
+    used = np.zeros(n, np.int64)
+    done = np.zeros(n, bool)
+    acc = np.zeros((n, z.shape[-1]), np.float64)
+    rows = np.arange(n)
+    for j in range(kmax):
+        has = order[:, j] >= 0
+        live = has & ~done
+        acc[live] += z[rows[live], order[live, j]]
+        used[live] = j + 1
+        if j + 1 >= kmin:
+            conf = exit_confidence(acc[live] / (j + 1))
+            done[np.flatnonzero(live)[conf >= theta]] = True
+        done |= ~has
+    return used
+
+
+def load_policy_params(path) -> dict:
+    """Optional v3 selection parameters (diversity weights, early-exit thresholds per budget)."""
+    a = np.load(path)
+    out = {}
+    if "div_lam_adj" in a.files:
+        out["lam_adj"], out["lam_sim"] = float(a["div_lam_adj"]), float(a["div_lam_sim"])
+    if "exit_budgets" in a.files:
+        out["exit"] = {int(b): float(t) for b, t in zip(a["exit_budgets"], a["exit_theta"])}
+        out["exit_kmax_mult"] = int(a["exit_kmax_mult"])
+    return out
+
+
 def _masked_mean(y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Per-frame mean of y over available tiles, broadcast back to (B,P)."""
     return ((y * mask).sum(1, keepdim=True) / mask.sum(1, keepdim=True)).expand_as(y)
